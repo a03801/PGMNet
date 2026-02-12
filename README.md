@@ -1,5 +1,4 @@
 
-````markdown
 # PGMNet (nnU-Net v2) — Osteomyelitis CT Segmentation (NIfTI)
 
 This repository provides the implementation of the PGMNet architecture (custom nnU-Net v2 trainer/network) and pretrained weights for **inference** on CT **NIfTI** files (`.nii.gz`). Inference is executed via `nnUNetv2_predict`.
