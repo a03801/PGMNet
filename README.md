@@ -1,8 +1,4 @@
-下面是一份**可直接替换你仓库 `README.md` 的完整版**（我把你原来的内容整体“收紧 + 纠错 + 补齐关键点”，并把“权重必须包含的元文件 dataset/plans”等写清楚；同时把 Git LFS、clone 后需要 `git lfs pull` 这些坑也提前堵住了）。
 
-你复制粘贴整段到 `README.md` 即可（保持英文更符合 NC/开源习惯；如果你想要中英双语我也能再给你一版）。
-
-```markdown
 # PGMNet (nnU-Net v2) — Osteomyelitis CT Segmentation (NIfTI)
 
 This repository provides the implementation of **PGMNet** (a custom **nnU-Net v2** trainer/network) and **pretrained weights** for **inference** on CT **NIfTI** files (`.nii.gz`). Inference is executed via the official `nnUNetv2_predict` CLI.
@@ -281,17 +277,6 @@ If you use this repository, please cite the associated manuscript (to be updated
 
 ---
 
-## 你还需要做的两件“仓库层面”检查（非常关键）
-1) **确认 `.gitattributes` 已在仓库**（如果你用了 Git LFS 推权重，这是必须的）。  
-   在仓库根目录执行：
-   ```bash
-   ls -lh .gitattributes
-````
 
-2. **确认权重目录里包含 3 个 json + 5 个 fold 权重**（你刚刚已经推过 json，但建议再核一次路径完全一致）：
 
-   ```bash
-   ls -lh weights/nnunet_results/all_on/Dataset10077_MyTask/nnUNetTrainerBoneAttention__nnUNetPlans__3d_fullres | egrep "dataset|plans|fold_"
-   ```
 
-如果你愿意，我也可以顺手帮你把 `requirements.txt` 写成**最不容易装崩**的版本（分成“必需”和“可选”，并避免把 torch 固死导致别人的 CUDA wheel 装不上）。
