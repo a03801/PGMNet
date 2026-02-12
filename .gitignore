@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+outputs/
+demo_input/
+
+.DS_Store
+
+# editor / tmp
+*.swp
+*~
