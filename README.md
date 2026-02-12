@@ -1,21 +1,78 @@
+下面是一份**可直接替换你仓库 `README.md` 的完整版**（我把你原来的内容整体“收紧 + 纠错 + 补齐关键点”，并把“权重必须包含的元文件 dataset/plans”等写清楚；同时把 Git LFS、clone 后需要 `git lfs pull` 这些坑也提前堵住了）。
 
+你复制粘贴整段到 `README.md` 即可（保持英文更符合 NC/开源习惯；如果你想要中英双语我也能再给你一版）。
+
+```markdown
 # PGMNet (nnU-Net v2) — Osteomyelitis CT Segmentation (NIfTI)
 
-This repository provides the implementation of the PGMNet architecture (custom nnU-Net v2 trainer/network) and pretrained weights for **inference** on CT **NIfTI** files (`.nii.gz`). Inference is executed via `nnUNetv2_predict`.
+This repository provides the implementation of **PGMNet** (a custom **nnU-Net v2** trainer/network) and **pretrained weights** for **inference** on CT **NIfTI** files (`.nii.gz`). Inference is executed via the official `nnUNetv2_predict` CLI.
+
+> **Scope**: inference only (pretrained models + reproducible inference script).  
+> **Input**: CT in NIfTI format (`.nii.gz`).  
+> **Output**: segmentation masks (and optional probability maps).
+
+---
+
+## Repository structure
+
+Key files/folders:
+
+```
+
+PGMNet/
+BoneAttentionUNetV2.py
+nnUNetTrainerBoneAttention.py
+scripts/
+batch_infer.py
+weights/
+nnunet_results/
+all_on/
+Dataset10077_MyTask/
+nnUNetTrainerBoneAttention__nnUNetPlans__3d_fullres/
+dataset.json
+dataset_fingerprint.json
+plans.json
+fold_0/checkpoint_best.pth
+fold_1/checkpoint_best.pth
+fold_2/checkpoint_best.pth
+fold_3/checkpoint_best.pth
+fold_4/checkpoint_best.pth
+
+````
+
+**Important**: nnU-Net v2 requires `dataset.json` (and typically `plans.json` / fingerprint) to be present in the model folder for inference. This repo includes these files.
 
 ---
 
 ## Tested environment
 
-The code and inference pipeline have been tested on:
+The code and inference pipeline were tested on:
 
-- **Python**: 3.9.23  
-- **PyTorch**: 2.5.1+cu121  
-- **CUDA (PyTorch build)**: 12.1  
-- **nnU-Net v2**: 2.5.2  
-- **GPU**: NVIDIA GeForce RTX 4070 (multiple GPUs)
+- **OS**: Linux
+- **Python**: 3.9.23
+- **PyTorch**: 2.5.1+cu121
+- **CUDA (PyTorch build)**: 12.1
+- **nnU-Net v2**: 2.5.2
+- **GPU**: NVIDIA GeForce RTX 4070 (multi-GPU supported)
 
-> Note: Your NVIDIA driver CUDA version can be higher (e.g., CUDA 12.8) while PyTorch is built with CUDA 12.1; this is normal as long as the driver supports the CUDA runtime required by PyTorch.
+> Note: Your NVIDIA driver CUDA version can be higher than the PyTorch CUDA build (e.g., driver shows CUDA 12.8 while PyTorch is cu121). This is normal as long as the driver supports the CUDA runtime required by PyTorch.
+
+---
+
+## Quickstart (inference)
+
+### 0) Clone (with Git LFS if weights are stored via LFS)
+
+If the repository uses Git LFS for `.pth` files, install LFS and pull weights:
+
+```bash
+git lfs install
+git clone https://github.com/a03801/PGMNet.git
+cd PGMNet
+git lfs pull
+````
+
+If you do not use Git LFS, normal `git clone` is enough.
 
 ---
 
@@ -26,26 +83,37 @@ The code and inference pipeline have been tested on:
 ```bash
 conda create -n nnunet python=3.9 -y
 conda activate nnunet
-````
-
-### 2) Install dependencies
-
-```bash
-pip install -r requirements.txt
-pip install nnunetv2==2.5.2
 ```
 
-> If you already installed nnU-Net v2, you can skip the second command.
+### 2) Install PyTorch (GPU)
+
+Install PyTorch that matches your CUDA runtime. For example (CUDA 12.1 build):
+
+```bash
+pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+```
+
+If you already have a working PyTorch + CUDA setup, you can skip this.
+
+### 3) Install nnU-Net v2 and other dependencies
+
+```bash
+pip install nnunetv2==2.5.2
+pip install -r requirements.txt
+```
+
+> If `requirements.txt` already includes `nnunetv2`, you can remove the separate `pip install nnunetv2==2.5.2`.
 
 ---
 
-## Make nnU-Net able to import the custom Trainer/Network (IMPORTANT)
+## IMPORTANT: allow nnU-Net to import the custom Trainer/Network
 
-nnU-Net v2 needs to import the custom trainer and network in this repository.
+nnU-Net v2 must be able to import the custom trainer and network defined in this repository.
 Before running inference, set `PYTHONPATH` to the repository root:
 
 ```bash
-export PYTHONPATH=/path/to/PGMNet:$PYTHONPATH
+cd /path/to/PGMNet
+export PYTHONPATH=$(pwd):$PYTHONPATH
 ```
 
 Verify imports:
@@ -54,39 +122,31 @@ Verify imports:
 python -c "import nnUNetTrainerBoneAttention; import BoneAttentionUNetV2; print('import ok')"
 ```
 
+> You may see warnings about `nnUNet_raw` / `nnUNet_preprocessed` / `nnUNet_results` when importing nnU-Net.
+> These warnings are common and **do not prevent inference**, because `scripts/batch_infer.py` sets `nnUNet_results` internally for the prediction call.
+
 ---
 
-## Pretrained weights (stored in this repository)
+## Pretrained weights (included)
 
-Weights are stored under `weights/nnunet_results/` using the nnU-Net v2 results layout:
+Weights are stored under `weights/nnunet_results/` in the standard nnU-Net v2 results layout:
 
-```
-weights/
-  nnunet_results/
-    all_on/
-      Dataset10077_MyTask/
-        nnUNetTrainerBoneAttention__nnUNetPlans__3d_fullres/
-          fold_0/checkpoint_best.pth
-          fold_1/checkpoint_best.pth
-          fold_2/checkpoint_best.pth
-          fold_3/checkpoint_best.pth
-          fold_4/checkpoint_best.pth
-```
-
-* `experiment`: `all_on`
-* `dataset_name`: `Dataset10077_MyTask`
-* `trainer`: `nnUNetTrainerBoneAttention`
-* `plans`: `nnUNetPlans`
-* `config`: `3d_fullres`
-* checkpoint: `checkpoint_best.pth` (default)
+* experiment: `all_on`
+* dataset_name: `Dataset10077_MyTask`
+* trainer: `nnUNetTrainerBoneAttention`
+* plans: `nnUNetPlans`
+* config: `3d_fullres`
+* checkpoint: `checkpoint_best.pth`
 
 ---
 
 ## Input format
 
 * Input must be **NIfTI**: `*.nii.gz`
-* The script processes **subfolders** under `--input_root`. Each subfolder can contain one or multiple NIfTI files.
-* nnU-Net expects modality suffix `_0000.nii.gz`. The script will automatically rename `*.nii.gz` to `*_0000.nii.gz` if needed.
+* The script processes **subfolders** under `--input_root`
+  (each subfolder is treated as one inference batch/case-group).
+* nnU-Net expects modality suffix `_0000.nii.gz`.
+  The script automatically renames `*.nii.gz` to `*_0000.nii.gz` if needed.
 
 Example input structure:
 
@@ -102,22 +162,32 @@ Example input structure:
 
 ## Run inference (multi-GPU batch)
 
-We provide a multi-GPU batch inference script:
+### Multi-GPU example
 
 ```bash
+cd /path/to/PGMNet
+export PYTHONPATH=$(pwd):$PYTHONPATH
+
 python scripts/batch_infer.py \
   --input_root /path/to/input_root \
   --output_root ./outputs \
-  --gpus 0,1,2
+  --gpus 0,1,2 \
+  --weights_root ./weights/nnunet_results \
+  --experiment all_on
 ```
 
-Single GPU example:
+### Single GPU example
 
 ```bash
+cd /path/to/PGMNet
+export PYTHONPATH=$(pwd):$PYTHONPATH
+
 python scripts/batch_infer.py \
   --input_root /path/to/input_root \
   --output_root ./outputs \
-  --gpus 0
+  --gpus 0 \
+  --weights_root ./weights/nnunet_results \
+  --experiment all_on
 ```
 
 Outputs will be written to:
@@ -130,6 +200,30 @@ outputs/
 
 ---
 
+## Output files
+
+* Predicted segmentation masks are written by `nnUNetv2_predict` to each `*_pred/` folder.
+* If `--save_prob` is enabled (default in the script), probability maps will also be saved.
+
+---
+
+## Script options
+
+To view all supported options:
+
+```bash
+python scripts/batch_infer.py -h
+```
+
+Common options include:
+
+* `--gpus 0,1,2` (comma-separated GPU IDs)
+* `--save_prob` / `--disable_tta`
+* `--dataset_id`, `--dataset_name`, `--trainer`, `--plans`, `--config`, `--checkpoint`
+* `--weights_root` and `--experiment` (recommended to keep default repo layout)
+
+---
+
 ## Troubleshooting
 
 ### 1) `ModuleNotFoundError: nnUNetTrainerBoneAttention`
@@ -137,17 +231,26 @@ outputs/
 You likely forgot to set `PYTHONPATH`:
 
 ```bash
-export PYTHONPATH=/path/to/PGMNet:$PYTHONPATH
+cd /path/to/PGMNet
+export PYTHONPATH=$(pwd):$PYTHONPATH
 ```
 
 ### 2) `No folds found ... checkpoint_best.pth`
 
-Check your weights directory layout matches the expected nnU-Net v2 structure under:
+Check your weights directory layout matches:
+
 `weights/nnunet_results/all_on/.../fold_k/checkpoint_best.pth`
 
-### 3) CUDA not available
+Also confirm `git lfs pull` was executed if using Git LFS.
 
-Confirm your PyTorch CUDA build and GPU availability:
+### 3) `FileNotFoundError: ... dataset.json`
+
+Your model folder is missing `dataset.json` (and possibly `plans.json`).
+This repo should include them under:
+
+`weights/nnunet_results/all_on/Dataset10077_MyTask/nnUNetTrainerBoneAttention__nnUNetPlans__3d_fullres/`
+
+### 4) CUDA not available
 
 ```bash
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
@@ -156,17 +259,11 @@ nvidia-smi
 
 ---
 
-## (Recommended) Git LFS for weights
+## nnU-Net citation
 
-Model weights (`*.pth`) are typically large. We strongly recommend Git LFS:
+Please cite the nnU-Net paper when using nnU-Net:
 
-```bash
-git lfs install
-git lfs track "*.pth"
-git add .gitattributes
-```
-
-Then commit and push as usual.
+Isensee, F. et al. *nnU-Net: a self-configuring method for deep learning-based biomedical image segmentation.* **Nature Methods** 18, 203–211 (2021).
 
 ---
 
@@ -176,20 +273,25 @@ See `LICENSE`.
 
 ---
 
-## Citation
+## Citation (PGMNet)
 
 If you use this repository, please cite the associated manuscript (to be updated after acceptance).
 
-```
+````
 
 ---
 
-### 你还需要补 2 个“仓库层面”的东西（很重要）
-1) **`.gitattributes`**（Git LFS track 生成的文件）要一起提交，不然 `.pth` 还是会按普通 Git 推。  
-2) 你 README 里 `/path/to/PGMNet`、`/path/to/input_root` 这种路径示例没问题，但你要确保仓库里真的有：
-- `scripts/batch_infer.py`
-- `weights/nnunet_results/.../checkpoint_best.pth`（至少 fold_0–fold_4）
+## 你还需要做的两件“仓库层面”检查（非常关键）
+1) **确认 `.gitattributes` 已在仓库**（如果你用了 Git LFS 推权重，这是必须的）。  
+   在仓库根目录执行：
+   ```bash
+   ls -lh .gitattributes
+````
 
-如果你把你仓库当前的 `weights/` 目录树（执行一次 `find weights -maxdepth 6 -type f | head` 的输出）贴出来，我可以帮你确认 README 里的“权重路径”是否完全对得上你脚本的探测逻辑，避免别人一跑就报 “No folds found”。
-::contentReference[oaicite:0]{index=0}
-```
+2. **确认权重目录里包含 3 个 json + 5 个 fold 权重**（你刚刚已经推过 json，但建议再核一次路径完全一致）：
+
+   ```bash
+   ls -lh weights/nnunet_results/all_on/Dataset10077_MyTask/nnUNetTrainerBoneAttention__nnUNetPlans__3d_fullres | egrep "dataset|plans|fold_"
+   ```
+
+如果你愿意，我也可以顺手帮你把 `requirements.txt` 写成**最不容易装崩**的版本（分成“必需”和“可选”，并避免把 torch 固死导致别人的 CUDA wheel 装不上）。
