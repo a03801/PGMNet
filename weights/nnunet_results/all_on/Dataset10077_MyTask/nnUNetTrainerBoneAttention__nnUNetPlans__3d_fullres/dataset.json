@@ -7,7 +7,7 @@
         "background": 0,
         "lesion": 1
     },
-    "numTraining": 271,
+    "numTraining": null,
     "file_ending": ".nii.gz",
     "overwrite_image_reader_writer": "SimpleITKIO"
 }
