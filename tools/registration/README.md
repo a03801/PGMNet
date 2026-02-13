@@ -22,6 +22,7 @@ This module defines a **reproducible** workflow for:
 
 
 
+
 ## 0) What “Reproducible” Means Here
 
 This workflow is reproducible because it defines a strict **Output Contract**.  
