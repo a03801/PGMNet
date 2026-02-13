@@ -12,14 +12,12 @@ try:
     import napari
     from magicgui import magicgui
 except Exception as e:
-    print(f"缺少依赖(用于GUI): {e}")
+    print(f"Missing GUI deps for Napari QC: {e}")
     napari = None
     magicgui = None
 
 
-# --------------------------
-# For QC slice pick only (optional)
-# --------------------------
+# ====== Bone params (ONLY for picking an informative QC slice) ======
 BONE_THR = 0.19
 BONE_HI  = 0.90
 
@@ -32,7 +30,8 @@ def to_LPS(img: sitk.Image) -> sitk.Image:
 
 
 def read_sitk(path: Path, pixel_type=sitk.sitkFloat32) -> Optional[sitk.Image]:
-    if path is None or (not Path(path).exists()):
+    path = Path(path)
+    if not path.exists():
         return None
     try:
         img = sitk.ReadImage(str(path))
@@ -42,8 +41,8 @@ def read_sitk(path: Path, pixel_type=sitk.sitkFloat32) -> Optional[sitk.Image]:
 
 
 def spacing_zyx(img: sitk.Image) -> Tuple[float, float, float]:
-    sx, sy, sz = img.GetSpacing()
-    return (sz, sy, sx)
+    sx, sy, sz = img.GetSpacing()  # x,y,z
+    return (sz, sy, sx)            # z,y,x for napari
 
 
 def auto_contrast(arr: np.ndarray) -> Tuple[float, float]:
@@ -80,6 +79,7 @@ def find_pre_ct_by_prefix(pre_dir: Path, prefix3: str) -> Optional[Path]:
     if not cands:
         return None
 
+    # deterministic preference: _0000 > not-mask > larger size
     def score(p: Path) -> float:
         s = 0.0
         name = p.name.lower()
@@ -101,50 +101,32 @@ def find_pre_ct_by_prefix(pre_dir: Path, prefix3: str) -> Optional[Path]:
 # Deterministic discovery of registration outputs (NO assumptions)
 # --------------------------
 def _parse_case_prefix_from_report(report: dict) -> Optional[str]:
-    # Prefer explicit fields if present
     for k in ["case_prefix3", "case_id", "case", "subject_id"]:
         v = report.get(k, None)
         if isinstance(v, str) and len(v) >= 3:
             return v[:3]
-
-    # fallback: if pre_ct path exists in report, use its filename prefix
     pre_ct = report.get("pre_ct", None)
-    if isinstance(pre_ct, str) and len(os.path.basename(pre_ct)) >= 3:
-        return os.path.basename(pre_ct)[:3]
-
-    return None
-
-
-def _prefix_from_dirname(p: Path) -> Optional[str]:
-    # deterministic: if dirname starts with 3 digits -> use them
-    m = re.match(r"^(\d{3})", p.name)
-    if m:
-        return m.group(1)
-    # else, if has any 3-digit substring, take first
-    m2 = re.search(r"(\d{3})", p.name)
-    if m2:
-        return m2.group(1)
+    if isinstance(pre_ct, str):
+        bn = os.path.basename(pre_ct)
+        if len(bn) >= 3:
+            return bn[:3]
     return None
 
 
 def index_registration_outputs(out_root: Path, strict: bool = True) -> Dict[str, Dict]:
     """
-    Build mapping: prefix3 -> {case_dir, reg_ct, final_tfm, report_json}
-    Deterministic rule for a valid case_dir:
-      - must contain registered_postop_ct.nii.gz
-      - must contain final_transform.tfm
-      - must contain report.json (if strict=True)
-    Case id is determined by:
-      - report.json field (case_prefix3/case_id/pre_ct filename prefix), else
-      - case_dir name (only used when strict=False)
+    Valid case_dir MUST contain:
+      - registered_postop_ct.nii.gz
+      - final_transform.tfm
+      - report.json   (required if strict=True)
+    Case prefix is determined from report.json (recommended).
     """
     out_root = Path(out_root)
     if not out_root.exists():
         raise FileNotFoundError(f"out_root not found: {out_root}")
 
-    # find all report.json first (preferred)
-    reports = list(out_root.rglob("report.json"))
     mapping: Dict[str, Dict] = {}
+    reports = list(out_root.rglob("report.json"))
 
     def try_add(case_dir: Path, report_path: Optional[Path]):
         reg_ct = case_dir / "registered_postop_ct.nii.gz"
@@ -153,51 +135,38 @@ def index_registration_outputs(out_root: Path, strict: bool = True) -> Dict[str,
             return
 
         prefix3 = None
-        report_obj = None
         if report_path is not None and report_path.exists():
             try:
-                report_obj = json.loads(report_path.read_text(encoding="utf-8"))
-                prefix3 = _parse_case_prefix_from_report(report_obj)
+                rep = json.loads(report_path.read_text(encoding="utf-8"))
+                prefix3 = _parse_case_prefix_from_report(rep)
             except Exception:
                 prefix3 = None
 
         if prefix3 is None:
             if strict:
-                return  # strict mode: must be determinable from report
-            prefix3 = _prefix_from_dirname(case_dir)
+                return
+            # non-strict fallback: first 3 digits in dirname
+            m = re.search(r"(\d{3})", case_dir.name)
+            if m:
+                prefix3 = m.group(1)
 
         if prefix3 is None:
             return
 
-        # handle duplicates deterministically: pick newest report/ct by mtime
-        prev = mapping.get(prefix3)
         cand_mtime = reg_ct.stat().st_mtime
+        prev = mapping.get(prefix3, None)
         if prev is None:
-            mapping[prefix3] = {
-                "case_dir": case_dir,
-                "reg_ct": reg_ct,
-                "final_tfm": tfm,
-                "report_json": report_path,
-            }
+            mapping[prefix3] = {"case_dir": case_dir, "reg_ct": reg_ct, "final_tfm": tfm, "report_json": report_path}
         else:
             prev_mtime = Path(prev["reg_ct"]).stat().st_mtime
             if cand_mtime > prev_mtime:
-                mapping[prefix3] = {
-                    "case_dir": case_dir,
-                    "reg_ct": reg_ct,
-                    "final_tfm": tfm,
-                    "report_json": report_path,
-                }
+                mapping[prefix3] = {"case_dir": case_dir, "reg_ct": reg_ct, "final_tfm": tfm, "report_json": report_path}
 
-    # index from reports
     for rp in reports:
-        case_dir = rp.parent
-        try_add(case_dir, rp)
+        try_add(rp.parent, rp)
 
     if not strict:
-        # also consider case dirs that only have files but no report.json
-        reg_files = list(out_root.rglob("registered_postop_ct.nii.gz"))
-        for reg_ct in reg_files:
+        for reg_ct in out_root.rglob("registered_postop_ct.nii.gz"):
             case_dir = reg_ct.parent
             rp = case_dir / "report.json"
             try_add(case_dir, rp if rp.exists() else None)
@@ -206,37 +175,107 @@ def index_registration_outputs(out_root: Path, strict: bool = True) -> Dict[str,
 
 
 # --------------------------
-# Manual output
+# Manual affine delta (translation + rotation + scaling)
 # --------------------------
-def apply_manual_translation_and_save(
+def _rotation_matrix_xyz(rx_deg: float, ry_deg: float, rz_deg: float) -> np.ndarray:
+    rx = np.deg2rad(rx_deg)
+    ry = np.deg2rad(ry_deg)
+    rz = np.deg2rad(rz_deg)
+
+    cx, sx = np.cos(rx), np.sin(rx)
+    cy, sy = np.cos(ry), np.sin(ry)
+    cz, sz = np.cos(rz), np.sin(rz)
+
+    Rx = np.array([[1, 0, 0],
+                   [0, cx, -sx],
+                   [0, sx, cx]], dtype=np.float64)
+    Ry = np.array([[cy, 0, sy],
+                   [0, 1, 0],
+                   [-sy, 0, cy]], dtype=np.float64)
+    Rz = np.array([[cz, -sz, 0],
+                   [sz,  cz, 0],
+                   [0,   0,  1]], dtype=np.float64)
+
+    # Apply X then Y then Z: R = Rz * Ry * Rx
+    return Rz @ Ry @ Rx
+
+
+def _fixed_physical_center(img: sitk.Image) -> Tuple[float, float, float]:
+    # size in x,y,z
+    sx, sy, sz = img.GetSize()
+    center_index = [(sx - 1) / 2.0, (sy - 1) / 2.0, (sz - 1) / 2.0]
+    center_point = img.TransformContinuousIndexToPhysicalPoint(center_index)
+    return (float(center_point[0]), float(center_point[1]), float(center_point[2]))
+
+
+def build_manual_affine_delta(
     fixed_ref: sitk.Image,
-    reg_img: sitk.Image,
+    shift_zyx_mm: Tuple[float, float, float],
+    rot_xyz_deg: Tuple[float, float, float],
+    scale_xyz: Tuple[float, float, float],
+) -> sitk.AffineTransform:
+    """
+    Napari shifts are provided as (z,y,x) in mm -> convert to xyz.
+    We save delta such that baking matches “napari positive shift” effect:
+      - translation in sitk is (-shift_xyz)
+    Rotation/scaling are applied around the fixed image physical center.
+
+    Model:
+      p_out -> p_in =  M * (p_out - c) + c + t
+    Where:
+      M = R @ S  (scale first, then rotate)
+      t = (-shift_x, -shift_y, -shift_z)
+    """
+    shift_z, shift_y, shift_x = [float(v) for v in shift_zyx_mm]
+    sx, sy, sz = [float(v) for v in scale_xyz]
+    rx, ry, rz = [float(v) for v in rot_xyz_deg]
+
+    # scale then rotate
+    S = np.diag([sx, sy, sz]).astype(np.float64)
+    R = _rotation_matrix_xyz(rx, ry, rz)
+    M = R @ S  # 3x3
+
+    delta = sitk.AffineTransform(3)
+    delta.SetCenter(_fixed_physical_center(fixed_ref))
+    delta.SetMatrix(tuple(M.reshape(-1).tolist()))
+
+    # IMPORTANT sign to match napari translate
+    delta.SetTranslation((-shift_x, -shift_y, -shift_z))
+    return delta
+
+
+def apply_affine_and_get_image(
+    fixed_ref: sitk.Image,
+    reg_img_in_fixed: sitk.Image,
+    delta_affine: sitk.Transform,
+    clamp01: bool = True,
+) -> sitk.Image:
+    out = sitk.Resample(reg_img_in_fixed, fixed_ref, delta_affine, sitk.sitkLinear, 0.0, sitk.sitkFloat32)
+    if clamp01:
+        out = sitk.Clamp(out, sitk.sitkFloat32, 0.0, 1.0)
+    return out
+
+
+def save_manual_outputs(
     case_dir: Path,
     prefix3: str,
+    fixed_ref: sitk.Image,
+    reg_img_in_fixed: sitk.Image,
     shift_zyx_mm: Tuple[float, float, float],
+    rot_xyz_deg: Tuple[float, float, float],
+    scale_xyz: Tuple[float, float, float],
     overwrite: bool = False,
-    save_png: bool = True
+    save_png: bool = True,
 ) -> Dict:
-    """
-    Napari layer.translate uses (z,y,x) in world units (mm if scale set).
-    Positive translate shifts the layer forward; to bake into voxels we resample with Translation(-shift_xyz).
-    """
     case_dir = Path(case_dir)
     case_dir.mkdir(parents=True, exist_ok=True)
 
-    shift_z, shift_y, shift_x = [float(v) for v in shift_zyx_mm]
-    shift_xyz = (shift_x, shift_y, shift_z)
-
-    delta = sitk.TranslationTransform(3, (-shift_xyz[0], -shift_xyz[1], -shift_xyz[2]))
-
-    reg_manual = sitk.Resample(
-        reg_img, fixed_ref, delta,
-        sitk.sitkLinear, 0.0, sitk.sitkFloat32
-    )
+    delta = build_manual_affine_delta(fixed_ref, shift_zyx_mm, rot_xyz_deg, scale_xyz)
+    reg_manual = apply_affine_and_get_image(fixed_ref, reg_img_in_fixed, delta, clamp01=True)
 
     out_default = case_dir / "registered_postop_ct.nii.gz"
     out_manual  = case_dir / "registered_postop_ct_manual.nii.gz"
-    out_tfm     = case_dir / "manual_delta_translation.tfm"
+    out_tfm     = case_dir / "manual_delta_affine.tfm"
     out_json    = case_dir / "manual_qc.json"
     out_png     = case_dir / "qc_manual.png"
 
@@ -249,8 +288,9 @@ def apply_manual_translation_and_save(
         try:
             import matplotlib.pyplot as plt
             fixed_arr = sitk.GetArrayFromImage(fixed_ref)
-            reg_arr = sitk.GetArrayFromImage(reg_img)
-            man_arr = sitk.GetArrayFromImage(reg_manual)
+            reg_arr   = sitk.GetArrayFromImage(reg_img_in_fixed)
+            man_arr   = sitk.GetArrayFromImage(reg_manual)
+
             bone = np.logical_and(fixed_arr > BONE_THR, fixed_arr <= BONE_HI)
             z = int(np.argmax(bone.reshape(bone.shape[0], -1).sum(axis=1))) if bone.any() else fixed_arr.shape[0] // 2
 
@@ -264,25 +304,35 @@ def apply_manual_translation_and_save(
         except Exception:
             qc_png_path = None
 
+    sz, sy, sx = [float(v) for v in shift_zyx_mm]
+    rx, ry, rz = [float(v) for v in rot_xyz_deg]
+    scx, scy, scz = [float(v) for v in scale_xyz]
+
     meta = {
         "case_prefix3": prefix3,
-        "shift_mm_zyx": [shift_z, shift_y, shift_x],
-        "shift_mm_xyz": [shift_xyz[0], shift_xyz[1], shift_xyz[2]],
-        "delta_transform_note": "Saved delta is Translation(-shift_xyz) to reproduce napari translate effect.",
-        "output_image": str(out_img),
-        "delta_transform_tfm": str(out_tfm),
-        "qc_png": str(qc_png_path) if qc_png_path else None,
+        "manual_params": {
+            "shift_mm_zyx": [sz, sy, sx],
+            "rotation_deg_xyz": [rx, ry, rz],
+            "scale_xyz": [scx, scy, scz],
+            "center_xyz_mm": list(_fixed_physical_center(fixed_ref)),
+            "matrix_model": "p_in = (R@S)*(p_out-center) + center + t, t = (-shift_xyz)",
+        },
+        "outputs": {
+            "output_image": str(out_img),
+            "delta_transform_tfm": str(out_tfm),
+            "qc_png": str(qc_png_path) if qc_png_path else None,
+        }
     }
     out_json.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return meta
 
 
 # --------------------------
-# Napari main
+# Napari QC main
 # --------------------------
 def run_qc_viewer(pre_dir: Path, out_root: Path, strict: bool = True):
     if napari is None or magicgui is None:
-        raise SystemExit("请先安装: pip install napari[all] magicgui pyqt5 matplotlib")
+        raise SystemExit("Install: pip install napari[all] magicgui pyqt5 matplotlib SimpleITK numpy")
 
     pre_dir = Path(pre_dir)
     out_root = Path(out_root)
@@ -293,15 +343,16 @@ def run_qc_viewer(pre_dir: Path, out_root: Path, strict: bool = True):
     prefixes = sorted(set(prefixes_pre).intersection(out_index.keys()))
     if not prefixes:
         raise RuntimeError(
-            "没有可核查病例。\n"
-            f"- 术前目录prefix数: {len(prefixes_pre)}\n"
-            f"- 配准输出可识别case数: {len(out_index)} (strict={strict})\n"
-            "请确认 out_root 下存在每例的 registered_postop_ct.nii.gz + final_transform.tfm + report.json。"
+            "No QC-able cases.\n"
+            f"- prefixes in pre_dir: {len(prefixes_pre)}\n"
+            f"- valid cases in out_root (strict={strict}): {len(out_index)}\n"
+            "Make sure each case_dir contains: registered_postop_ct.nii.gz + final_transform.tfm + report.json."
         )
 
-    viewer = napari.Viewer(title="自动配准结果人工核查（只读加载 + 手动输出）")
+    viewer = napari.Viewer(title="Manual QC for registered_postop_ct (Affine delta export)")
 
-    state = {"fixed": None, "reg": None, "case_dir": None}
+    # state
+    state: Dict[str, Optional[object]] = {"fixed": None, "reg": None, "case_dir": None, "prefix": None}
 
     def load_case(prefix3: str):
         rec = out_index[prefix3]
@@ -310,25 +361,26 @@ def run_qc_viewer(pre_dir: Path, out_root: Path, strict: bool = True):
 
         pre_ct = find_pre_ct_by_prefix(pre_dir, prefix3)
         if pre_ct is None:
-            raise RuntimeError(f"术前找不到 prefix={prefix3} 的CT")
+            raise RuntimeError(f"Missing pre CT for prefix={prefix3}")
 
         fixed = read_sitk(pre_ct, sitk.sitkFloat32)
         reg = read_sitk(reg_ct, sitk.sitkFloat32)
         if fixed is None or reg is None:
-            raise RuntimeError("读取影像失败")
+            raise RuntimeError("Failed to read images.")
 
         fixed = to_LPS(fixed)
         reg = to_LPS(reg)
 
-        # safety resample to fixed grid
+        # Ensure on same grid
         reg = sitk.Resample(reg, fixed, sitk.Transform(), sitk.sitkLinear, 0.0, sitk.sitkFloat32)
 
         state["fixed"] = fixed
         state["reg"] = reg
         state["case_dir"] = case_dir
-        return fixed, reg, pre_ct, reg_ct
+        state["prefix"] = prefix3
+        return fixed, reg, pre_ct, reg_ct, case_dir
 
-    fixed0, reg0, pre0, regp0 = load_case(prefixes[0])
+    fixed0, reg0, _, _, _ = load_case(prefixes[0])
     arr_f = sitk.GetArrayFromImage(fixed0)
     arr_r = sitk.GetArrayFromImage(reg0)
     scale = spacing_zyx(fixed0)
@@ -343,32 +395,66 @@ def run_qc_viewer(pre_dir: Path, out_root: Path, strict: bool = True):
     except Exception:
         pass
 
-    l_red = viewer.add_image(arr_r, name="Registered post (red)", scale=scale, colormap="red",
-                             blending="additive", opacity=0.5, contrast_limits=cl)
+    l_red = viewer.add_image(
+        arr_r,
+        name="Registered post (red)",
+        scale=scale,
+        colormap="red",
+        blending="additive",
+        opacity=0.5,
+        contrast_limits=cl
+    )
 
     viewer.dims.order = (1, 0, 2)
 
+    # --- UI ---
     @magicgui(
         layout="vertical",
-        case_prefix={"choices": prefixes, "label": "病例ID (前3位)"},
-        red_opacity={"min": 0, "max": 1, "step": 0.05, "label": "红CT 透明度", "value": 0.5},
-        auto_window={"label": "自动窗宽(1-99%)", "value": True},
-        sep_line={"widget_type": "Label", "label": "--- 微调 (mm) + 输出 ---"},
-        shift_z={"min": -50, "max": 50, "step": 0.5, "label": "Z 平移(mm)", "value": 0},
-        shift_y={"min": -50, "max": 50, "step": 0.5, "label": "Y 平移(mm)", "value": 0},
-        shift_x={"min": -50, "max": 50, "step": 0.5, "label": "X 平移(mm)", "value": 0},
-        overwrite={"label": "覆盖 registered_postop_ct.nii.gz", "value": False},
-        save_png={"label": "输出 qc_manual.png", "value": True},
-        save_btn={"widget_type": "PushButton", "text": "保存当前微调结果"},
-        reset_btn={"widget_type": "PushButton", "text": "重置微调"},
-    )
-    def widget(case_prefix: str, red_opacity=0.5, auto_window=True, sep_line="---",
-               shift_z=0.0, shift_y=0.0, shift_x=0.0,
-               overwrite=False, save_png=True, save_btn=False, reset_btn=False):
+        case_prefix={"choices": prefixes, "label": "Case (first 3 chars)"},
+        red_opacity={"min": 0, "max": 1, "step": 0.05, "label": "Red opacity", "value": 0.5},
+        auto_window={"label": "Auto window (1–99%)", "value": True},
 
+        sep0={"widget_type": "Label", "label": "--- Fast translate (mm) for quick viewing ---"},
+        shift_z={"min": -50, "max": 50, "step": 0.5, "label": "Shift Z (mm)", "value": 0.0},
+        shift_y={"min": -50, "max": 50, "step": 0.5, "label": "Shift Y (mm)", "value": 0.0},
+        shift_x={"min": -50, "max": 50, "step": 0.5, "label": "Shift X (mm)", "value": 0.0},
+
+        sep1={"widget_type": "Label", "label": "--- Affine delta (applied on Preview/Save) ---"},
+        rot_x={"min": -15, "max": 15, "step": 0.25, "label": "Rotate X (deg)", "value": 0.0},
+        rot_y={"min": -15, "max": 15, "step": 0.25, "label": "Rotate Y (deg)", "value": 0.0},
+        rot_z={"min": -15, "max": 15, "step": 0.25, "label": "Rotate Z (deg)", "value": 0.0},
+        scale_x={"min": 0.90, "max": 1.10, "step": 0.005, "label": "Scale X", "value": 1.0},
+        scale_y={"min": 0.90, "max": 1.10, "step": 0.005, "label": "Scale Y", "value": 1.0},
+        scale_z={"min": 0.90, "max": 1.10, "step": 0.005, "label": "Scale Z", "value": 1.0},
+
+        preview_btn={"widget_type": "PushButton", "text": "Preview (resample once)"},
+        save_btn={"widget_type": "PushButton", "text": "Save manual outputs"},
+        overwrite={"label": "Overwrite registered_postop_ct.nii.gz", "value": False},
+        save_png={"label": "Also save qc_manual.png", "value": True},
+        reset_btn={"widget_type": "PushButton", "text": "Reset params"},
+    )
+    def widget(
+        case_prefix: str,
+        red_opacity=0.5,
+        auto_window=True,
+
+        sep0="---",
+        shift_z=0.0, shift_y=0.0, shift_x=0.0,
+
+        sep1="---",
+        rot_x=0.0, rot_y=0.0, rot_z=0.0,
+        scale_x=1.0, scale_y=1.0, scale_z=1.0,
+
+        preview_btn=False,
+        save_btn=False,
+        overwrite=False,
+        save_png=True,
+        reset_btn=False,
+    ):
+        # Switch case
         target = f"Fixed(pre): {case_prefix}"
         if l_fixed.name != target:
-            fixed, reg, _, _ = load_case(case_prefix)
+            fixed, reg, _, _, _ = load_case(case_prefix)
             arr_f = sitk.GetArrayFromImage(fixed)
             arr_r = sitk.GetArrayFromImage(reg)
 
@@ -379,9 +465,16 @@ def run_qc_viewer(pre_dir: Path, out_root: Path, strict: bool = True):
             l_red.data = arr_r
             l_red.scale = spacing_zyx(fixed)
 
-            widget.shift_z.value = 0
-            widget.shift_y.value = 0
-            widget.shift_x.value = 0
+            # reset params on case switch
+            widget.shift_z.value = 0.0
+            widget.shift_y.value = 0.0
+            widget.shift_x.value = 0.0
+            widget.rot_x.value = 0.0
+            widget.rot_y.value = 0.0
+            widget.rot_z.value = 0.0
+            widget.scale_x.value = 1.0
+            widget.scale_y.value = 1.0
+            widget.scale_z.value = 1.0
 
             if auto_window:
                 cl_f = auto_contrast(arr_f)
@@ -390,8 +483,9 @@ def run_qc_viewer(pre_dir: Path, out_root: Path, strict: bool = True):
                 l_fixed.contrast_limits = cl2
                 l_red.contrast_limits = cl2
 
+        # Live: opacity + fast translate only
         l_red.opacity = red_opacity
-        l_red.translate = (shift_z, shift_y, shift_x)
+        l_red.translate = (float(shift_z), float(shift_y), float(shift_x))
 
         if auto_window:
             arr_f = l_fixed.data
@@ -404,58 +498,99 @@ def run_qc_viewer(pre_dir: Path, out_root: Path, strict: bool = True):
 
     @widget.reset_btn.changed.connect
     def _reset():
-        widget.shift_z.value = 0
-        widget.shift_y.value = 0
-        widget.shift_x.value = 0
+        widget.shift_z.value = 0.0
+        widget.shift_y.value = 0.0
+        widget.shift_x.value = 0.0
+        widget.rot_x.value = 0.0
+        widget.rot_y.value = 0.0
+        widget.rot_z.value = 0.0
+        widget.scale_x.value = 1.0
+        widget.scale_y.value = 1.0
+        widget.scale_z.value = 1.0
+
+    def _bake_in_memory():
+        fixed = state["fixed"]
+        reg = state["reg"]
+        if fixed is None or reg is None:
+            print("[PREVIEW] No case loaded.")
+            return None
+
+        delta = build_manual_affine_delta(
+            fixed_ref=fixed,
+            shift_zyx_mm=(float(widget.shift_z.value), float(widget.shift_y.value), float(widget.shift_x.value)),
+            rot_xyz_deg=(float(widget.rot_x.value), float(widget.rot_y.value), float(widget.rot_z.value)),
+            scale_xyz=(float(widget.scale_x.value), float(widget.scale_y.value), float(widget.scale_z.value)),
+        )
+        out = apply_affine_and_get_image(fixed, reg, delta, clamp01=True)
+        return out
+
+    @widget.preview_btn.changed.connect
+    def _preview():
+        out = _bake_in_memory()
+        if out is None:
+            return
+        # Update red layer with baked preview, and reset fast translate to 0
+        state["reg"] = out
+        l_red.data = sitk.GetArrayFromImage(out)
+
+        widget.shift_z.value = 0.0
+        widget.shift_y.value = 0.0
+        widget.shift_x.value = 0.0
+        # keep rot/scale as-is so user can still see params; optional: reset if you prefer
+
+        print("[PREVIEW] Applied affine delta in memory (one resample).")
 
     @widget.save_btn.changed.connect
     def _save():
-        prefix3 = widget.case_prefix.value
         fixed = state["fixed"]
         reg = state["reg"]
         case_dir = state["case_dir"]
-        if fixed is None or reg is None or case_dir is None:
-            print("[SAVE] 当前病例未加载，无法保存。")
+        prefix3 = state["prefix"]
+        if fixed is None or reg is None or case_dir is None or prefix3 is None:
+            print("[SAVE] No case loaded.")
             return
 
-        meta = apply_manual_translation_and_save(
-            fixed_ref=fixed,
-            reg_img=reg,
+        meta = save_manual_outputs(
             case_dir=Path(case_dir),
-            prefix3=prefix3,
+            prefix3=str(prefix3),
+            fixed_ref=fixed,
+            reg_img_in_fixed=reg,
             shift_zyx_mm=(float(widget.shift_z.value), float(widget.shift_y.value), float(widget.shift_x.value)),
+            rot_xyz_deg=(float(widget.rot_x.value), float(widget.rot_y.value), float(widget.rot_z.value)),
+            scale_xyz=(float(widget.scale_x.value), float(widget.scale_y.value), float(widget.scale_z.value)),
             overwrite=bool(widget.overwrite.value),
-            save_png=bool(widget.save_png.value)
+            save_png=bool(widget.save_png.value),
         )
-        print(f"[SAVE] OK: {meta['output_image']}")
-        print(f"       delta: {meta['delta_transform_tfm']}")
+        print(f"[SAVE] OK: {meta['outputs']['output_image']}")
+        print(f"       tfm: {meta['outputs']['delta_transform_tfm']}")
 
-        # reload saved image into red layer, reset translate to 0 so view matches file
-        new_reg = read_sitk(Path(meta["output_image"]), sitk.sitkFloat32)
+        # After save, load saved image into red layer and reset translate (so view matches file)
+        saved_path = Path(meta["outputs"]["output_image"])
+        new_reg = read_sitk(saved_path, sitk.sitkFloat32)
         if new_reg is not None:
             new_reg = to_LPS(new_reg)
             new_reg = sitk.Resample(new_reg, fixed, sitk.Transform(), sitk.sitkLinear, 0.0, sitk.sitkFloat32)
             state["reg"] = new_reg
             l_red.data = sitk.GetArrayFromImage(new_reg)
 
-        widget.shift_z.value = 0
-        widget.shift_y.value = 0
-        widget.shift_x.value = 0
+        # reset fast translate
+        widget.shift_z.value = 0.0
+        widget.shift_y.value = 0.0
+        widget.shift_x.value = 0.0
 
     viewer.window.add_dock_widget(widget, area="right")
     napari.run()
 
 
 def parse_args():
-    ap = argparse.ArgumentParser(description="Napari QC viewer for registered_postop_ct outputs (deterministic discovery).")
-    ap.add_argument("--pre_dir", type=Path, required=True, help="术前CT目录（用于找prefix列表和加载fixed）")
-    ap.add_argument("--out_root", type=Path, required=True, help="配准输出根目录（递归扫描report.json确定case）")
+    ap = argparse.ArgumentParser(description="Napari manual QC for registered_postop_ct with affine delta export.")
+    ap.add_argument("--pre_dir", type=Path, required=True, help="Directory containing pre-op CTs (used as fixed)")
+    ap.add_argument("--out_root", type=Path, required=True, help="Root directory containing auto registration outputs")
     ap.add_argument("--strict", action="store_true", default=False,
-                    help="严格模式：只接受同时包含 report.json + final_transform.tfm + registered_postop_ct.nii.gz 的case")
+                    help="Strict mode: require report.json + final_transform.tfm + registered_postop_ct.nii.gz")
     return ap.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    # 默认 strict=False 是为了更兼容旧输出；但你强调可复现，建议你运行时加 --strict
     run_qc_viewer(args.pre_dir, args.out_root, strict=bool(args.strict))
