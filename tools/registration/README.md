@@ -10,10 +10,13 @@ This module defines a **reproducible** workflow for:
 
 ---
 
-![Napari overlay preview](assets/001_2.png)
-![Napari overlay preview](assets/001_1.png)
-![Napari overlay preview](assets/001_3.png)
-![Napari overlay preview](assets/001_4.png)
+<p align="center">
+  <img src="assets/001_1.png" width="240" />
+  <img src="assets/001_2.png" width="240" />
+  <img src="assets/001_3.png" width="240" />
+  <img src="assets/001_4.png" width="240" />
+</p>
+
 
 
 
