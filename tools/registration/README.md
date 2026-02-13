@@ -1,38 +1,44 @@
+# Reproducible CT Registration + Manual QC (Napari)
 
-# CT Registration + Manual QC (Reproducible Workflow)
+This module defines a **reproducible** workflow for:
+1) **Automatic pre/post CT registration** (Rigid → Affine, SimpleITK) using a **bone ROI** for optimization.
+2) **Manual QC and correction** (Napari) that can apply **translation + rotation + scaling** as a *delta affine* **without re-running registration**, and exports artifacts so anyone can reproduce the exact correction.
 
-This folder provides a **reproducible** two-step workflow for registering pre-op and post-op CT volumes and then performing **human-in-the-loop quality control (QC)** in Napari **without re-running registration**.
-
-- **Step 1 — Automatic registration (SimpleITK):** Rigid → Affine, optimized using **Mattes Mutual Information** computed only within a **bone ROI**.
-- **Step 2 — Manual QC (Napari):** Load the automatic output and visually inspect overlay. If needed, apply a small **translation correction (mm)** and **export** a “baked” corrected image + transform for reproducibility.
-
-> **Privacy note:** Do not commit real patient data, screenshots, or any internal network paths (UNC/IP/usernames) to a public repository.
-
----
-
-## 1) Input Assumptions (Required for Reproducibility)
-
-### 1.1 File formats
-Supported image formats:
-- `*.nii`, `*.nii.gz`, `*.mha`
-
-### 1.2 Intensity convention (critical)
-All CT volumes used by this pipeline are assumed to be:
-1. **Clipped** to a consistent HU window (example: HU `[200, 1800]`)
-2. **Normalized** to **[0, 1]**
-
-If your inputs are not normalized to `[0,1]`, the bone ROI definition below will be invalid and registration quality will suffer.
+> ⚠️ **Privacy / Security**
+> - Do **NOT** commit any patient images (`.nii/.nii.gz/.mha/.dcm`), outputs, screenshots, or internal network paths (UNC/IP/usernames).
+> - Use placeholder paths in docs and configs.
 
 ---
 
-## 2) Fixed Parameters (Hard-coded)
+## 0) What “Reproducible” Means Here
 
-To ensure consistent behavior across machines/users, these ROI parameters are fixed:
+This workflow is reproducible because it defines a strict **Output Contract**.  
+The manual QC script does **not** assume any directory naming scheme. It **discovers** valid cases by recursively scanning `out_root` and validating required files.
+
+---
+
+## 1) Input Requirements
+
+### 1.1 Formats
+Supported: `*.nii`, `*.nii.gz`, `*.mha`
+
+### 1.2 Intensity Convention (Required)
+All CT inputs must already be:
+- clipped to a consistent HU range (example: `[200, 1800]` HU)
+- normalized to **[0, 1]**
+
+If inputs are not `[0,1]`, the bone ROI thresholding and the QC windowing will be invalid.
+
+---
+
+## 2) Hard-coded Bone ROI Rules (Fixed)
+
+To ensure consistent behavior across users, the following are fixed:
 
 - `BONE_THR = 0.19`
 - `BONE_HI  = 0.90`  (**hard-coded**)
 
-Bone ROI mask is computed as:
+Bone ROI mask definition:
 
 ```
 
@@ -40,28 +46,29 @@ bone = (img > 0.19) AND (img <= 0.90)
 
 ```
 
-`BONE_HI` excludes very high values (e.g., metal/saturation) from the ROI so they do not dominate MI.
+`BONE_HI` excludes extremely high values (e.g., metal/saturation) from dominating the metric.
 
 ---
 
-## 3) Step 1 — Automatic Registration Script
+## 3) Step 1 — Automatic Registration (SimpleITK)
 
-### 3.1 Output Contract (the key to reproducibility)
+### 3.1 Output Contract (Mandatory)
+For each case, the registration step produces a **case output directory** (`case_dir`).
+A `case_dir` is considered **valid** only if it contains all of:
 
-For each case, the registration script writes a **case output directory** (`case_dir`).  
-A `case_dir` is considered a **valid** registration output **only if** it contains all of the following:
+1) `registered_postop_ct.nii.gz`  
+2) `final_transform.tfm`  
+3) `report.json`
 
-1. `registered_postop_ct.nii.gz`
-2. `final_transform.tfm`
-3. `report.json`  
-   - strongly recommended fields:
-     - `case_prefix3` (preferred)  
-     - or at least `pre_ct` (so case can be deterministically inferred from the pre-op filename prefix)
+**Recommendation (strong):** `report.json` should include:
+- `case_prefix3` (preferred)  
+OR at least:
+- `pre_ct` (so the case id can be deterministically derived from the pre-op filename prefix)
 
-> The Napari QC script will **not assume** any directory naming convention. It will **discover** valid cases by recursively scanning `out_root` and enforcing this Output Contract.
+> The manual QC script will discover cases by enforcing the Output Contract above.
 
-### 3.2 Recommended output layout (example only)
-You may store outputs like this (but the QC script does not rely on the folder names):
+### 3.2 Example Output Layout (Example Only)
+This is a *recommended* layout, but **not required** by the QC script:
 
 ```
 
@@ -78,11 +85,9 @@ qc_preview.png
 
 ````
 
-### 3.3 Run examples
+### 3.3 Run Examples (Replace with your own paths)
 
-> Replace all paths below with your own local/server paths. Do not commit real paths into the repo.
-
-**Mode A — Explicit paths**
+**Mode A — Provide paths explicitly**
 ```bash
 python ct_reg_bone_mi.py \
   --pre_ct  "/path/to/pre/005_0000.nii.gz" \
@@ -91,7 +96,7 @@ python ct_reg_bone_mi.py \
   --qc_png
 ````
 
-**Mode B — Case prefix auto-match (first 3 characters)**
+**Mode B — Auto-match by case prefix (first 3 characters)**
 
 ```bash
 python ct_reg_bone_mi.py \
@@ -104,36 +109,38 @@ python ct_reg_bone_mi.py \
 
 ---
 
-## 4) Step 2 — Manual QC in Napari (No Re-registration)
+## 4) Step 2 — Manual QC + Manual Correction Export (Napari)
 
-The manual QC script is designed for:
+The QC script loads:
 
-* loading **pre-op CT** (fixed)
-* loading the auto-registered **registered_postop_ct.nii.gz** (moving, already in fixed space)
-* visually checking alignment in Napari via overlay (gray + red)
-* optionally applying a small **translation correction (mm)**
-* exporting corrected outputs so another user can reproduce the exact correction
+* **Pre-op CT** as the fixed reference (from `--pre_dir`)
+* **Auto-registered post-op CT** (`registered_postop_ct.nii.gz`) from `--out_root`
 
-### 4.1 Deterministic discovery of cases (no assumptions)
+You can visually inspect overlay and apply a **delta affine**:
 
-At startup, the QC script:
+* Translation (mm)
+* Rotation (degrees)
+* Scaling (unitless)
 
-1. Recursively scans `--out_root` for candidate case directories.
-2. Marks a case as **valid** only if it contains:
+Then you export:
 
-   * `registered_postop_ct.nii.gz`
-   * `final_transform.tfm`
-   * `report.json` (**required in strict mode**)
-3. Determines `case_prefix3` primarily from `report.json`:
+* a **baked** corrected image (`registered_postop_ct_manual.nii.gz` by default)
+* the **delta affine transform** used (`manual_delta_affine.tfm`)
+* a **JSON record** of parameters (`manual_qc.json`)
+* optional QC screenshot (`qc_manual.png`)
 
-   * prefer `case_prefix3`, otherwise fall back to `pre_ct` filename prefix
-4. Builds the QC dropdown list as:
+### 4.1 Deterministic Case Discovery (No Assumptions)
 
-   * `prefixes_in_pre_dir ∩ prefixes_in_out_root_index`
+At startup the QC script:
 
-Therefore, given the same inputs on disk, the case list and file mapping are reproducible.
+1. recursively scans `--out_root`
+2. validates Output Contract files
+3. determines case id from `report.json` (preferred)
+4. populates the UI case list from:
 
-### 4.2 Run (recommended with strict validation)
+   * `prefixes_in_pre_dir ∩ prefixes_discovered_in_out_root`
+
+### 4.2 Run (Recommended: strict mode)
 
 ```bash
 python napari_manual_qc.py \
@@ -142,26 +149,26 @@ python napari_manual_qc.py \
   --strict
 ```
 
-* `--strict` enforces the Output Contract with `report.json` and avoids any “guessing”.
+`--strict` = require `report.json + final_transform.tfm + registered_postop_ct.nii.gz` for every case.
 
-### 4.3 Manual correction outputs
+### 4.3 What Gets Written (Per Case)
 
-After adjusting translation in Napari and clicking **Save**, the script writes to the corresponding `case_dir`:
+Outputs are saved into the corresponding `case_dir`:
 
-* `registered_postop_ct_manual.nii.gz` (manual-corrected image)
-* `manual_delta_translation.tfm` (manual translation delta)
-* `manual_qc.json` (records translation values and output paths)
-* `qc_manual.png` (optional QC screenshot)
+* `registered_postop_ct_manual.nii.gz` *(default; unless overwrite enabled)*
+* `manual_delta_affine.tfm`
+* `manual_qc.json`
+* `qc_manual.png` *(optional)*
 
-Optionally, you can choose to **overwrite** `registered_postop_ct.nii.gz` (not recommended by default—keep both versions for auditability).
+**Optional overwrite:** You may overwrite `registered_postop_ct.nii.gz`, but it is recommended to keep both auto and manual outputs for auditability.
 
-### 4.4 Translation units and sign convention (reproducibility detail)
+### 4.4 Units and Transform Convention (Important Detail)
 
-* Napari translation uses `(z, y, x)`.
-* With `scale=spacing`, the translation units are **millimeters (mm)**.
-* When exporting, the script converts Napari translation into a SimpleITK transform used for resampling:
+* Napari translation is `(z, y, x)`
+* With `scale=spacing`, translation units are **millimeters (mm)**
 
-  * it saves `Translation(-shift_xyz)` so that the written image is “baked” and loads aligned **without needing Napari translate**.
+When exporting, the script saves a delta transform that reproduces Napari movement and writes a baked image.
+In the saved JSON you will see the sign/model used, so another user can reproduce the correction exactly.
 
 ---
 
@@ -181,14 +188,13 @@ pip install napari[all] magicgui pyqt5 matplotlib SimpleITK numpy
 
 ---
 
-## 6) Repository Hygiene (Do Not Leak Data)
+## 6) Repository Hygiene (Avoid Leaks)
 
-### 6.1 Do not commit
+### 6.1 Do NOT commit
 
-* patient images (`*.nii*`, `*.mha`, `*.dcm`)
-* any output folders (e.g., `registration_outputs/`)
-* any QC PNGs if they might contain identifying overlays or paths
-* internal network paths / UNC / IP addresses / usernames
+* any patient images (`*.nii`, `*.nii.gz`, `*.mha`, `*.dcm`)
+* any outputs (`registration_outputs/`, QC PNGs, transforms)
+* any internal UNC/IP paths or usernames
 
 ### 6.2 Recommended `.gitignore`
 
@@ -200,35 +206,41 @@ pip install napari[all] magicgui pyqt5 matplotlib SimpleITK numpy
 **/registration_outputs/
 **/qc_preview*.png
 **/qc_manual*.png
+**/*.tfm
+**/report.json
 config.local.*
 .env
 ```
+
+> Tip: keep `report.json` out of git if it contains sensitive paths.
+> If you need reports in git, ensure they contain only sanitized, relative paths.
 
 ---
 
 ## 7) FAQ
 
-### Q1: Why is everything black in Napari?
+### Q1) Napari shows everything black
 
 Most common causes:
 
-* intensity is not normalized to `[0,1]`
-* window/level is not appropriate
-  This QC script typically uses percentile-based auto-windowing (1–99%). If it is still black, verify input normalization.
+* input intensities are not normalized to `[0,1]`
+* windowing is not appropriate
+  This workflow expects `[0,1]` and typically uses percentile auto-windowing.
 
-### Q2: Can manual QC do rotation/scale?
+### Q2) Can I do rotation/scale manually?
 
-No. Manual QC here is translation-only, intended for small residual misalignment. For rotation/scale issues, re-run or improve the automatic registration step.
+Yes. Manual QC supports **translation + rotation + scaling** and exports a **delta affine transform** plus a baked corrected image.
 
-### Q3: Why use `--strict`?
+### Q3) Why strict mode?
 
-Strict mode enforces the Output Contract and prevents ambiguous mapping from folder names—this is the easiest way to guarantee deterministic, reproducible loading.
+Strict mode prevents any ambiguous “guessing” of where outputs are.
+It guarantees deterministic discovery via the Output Contract.
 
 ---
 
 ## 8) Suggested Repo Layout
 
-Recommended structure:
+Recommended:
 
 ```
 tools/registration/
