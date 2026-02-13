@@ -3,7 +3,16 @@
 
 This repository provides the implementation of **PGMNet** (a custom **nnU-Net v2** trainer/network) and **pretrained weights** for **inference** on CT **NIfTI** files (`.nii.gz`). Inference is executed via the official `nnUNetv2_predict` CLI.
 
-> **Scope**: inference only (pretrained models + reproducible inference script).  
+> **Scope**: inference only (pretrained models + reproducible inference script).
+> ## Related tools (optional)
+
+This repository focuses on **inference** with pretrained nnU-Net v2 weights.
+
+If you also need **CT registration / manual QC visualization** for aligning pre/post CT or reviewing overlays, see:
+- `tools/registration/` (SimpleITK registration + Napari QC viewer)
+
+> Note: Paper-specific statistical analysis (e.g., recurrence modeling) is **not** included in this public release.
+
 > **Input**: CT in NIfTI format (`.nii.gz`).  
 > **Output**: segmentation masks (and optional probability maps).
 
