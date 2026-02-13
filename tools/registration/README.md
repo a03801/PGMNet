@@ -3,13 +3,13 @@
 This module defines a **reproducible** workflow for:
 1) **Automatic pre/post CT registration** (Rigid → Affine, SimpleITK) using a **bone ROI** for optimization.
 2) **Manual QC and correction** (Napari) that can apply **translation + rotation + scaling** as a *delta affine* **without re-running registration**, and exports artifacts so anyone can reproduce the exact correction.
-3) Manual QC focus (bone-only):
+**3) Manual QC focus (bone-only):**
 
-Ignore: global pose differences, translation/rotation outside the joint region, and soft-tissue deformation.
+    Ignore: global pose differences, translation/rotation outside the joint region, and soft-tissue deformation.
 
-Evaluate only: rigid anatomical alignment of the target bone, using cortical contours and key bony landmarks as the reference.
+    Evaluate only: rigid anatomical alignment of the target bone, using cortical contours and key bony landmarks as the reference.
 
-Pass criterion: good overlap of cortical boundaries and consistent landmarks within the target bone ROI.
+    Pass criterion: good overlap of cortical boundaries and consistent landmarks within the target bone ROI.
 
 > ⚠️ **Privacy / Security**
 > - Do **NOT** commit any patient images (`.nii/.nii.gz/.mha/.dcm`), outputs, screenshots, or internal network paths (UNC/IP/usernames).
