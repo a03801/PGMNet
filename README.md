@@ -1,19 +1,26 @@
-
 # PGMNet — Osteomyelitis CT Segmentation (NIfTI)
 
 This repository provides the implementation of **PGMNet** (a custom **nnU-Net v2** trainer/network) and **pretrained weights** for **inference** on CT **NIfTI** files (`.nii.gz`). Inference is executed via the official `nnUNetv2_predict` CLI.
 
-> **Scope**: inference only (pretrained models + reproducible inference script).
-> ## Related tools (optional)
+**Scope (public release):**
+- **Inference**: pretrained models + reproducible inference script.
+- **Optional workflow tools**: CT registration + Napari-based manual QC + coverage visualization.
+- **Input**: CT in NIfTI format (`.nii.gz`)
+- **Output**: segmentation masks (and optional probability maps)
 
-This repository focuses on **inference** with pretrained nnU-Net v2 weights.
+> Note: Paper-specific statistical analysis code and patient-level data are **not** included in this public repository.
 
-If you also need **CT registration / manual QC visualization** for aligning pre/post CT or reviewing overlays, see:
-- `tools/registration/` (SimpleITK registration + Napari QC viewer)
+---
 
+## Related tools (optional)
 
-> **Input**: CT in NIfTI format (`.nii.gz`).  
-> **Output**: segmentation masks (and optional probability maps).
+This repository primarily focuses on inference. Optional workflow utilities are included for reproducibility and manual QC:
+
+- `tools/registration/ct_reg_bone_mi.py` — automatic pre/post CT registration (SimpleITK; MI computed on bone ROI)
+- `tools/registration/napari_manual_qc.py` — Napari-based manual QC viewer for registration overlays (focus on rigid bone alignment)
+- `tools/coverage/napari_coverage_viewer.py` — Napari overlay viewer with coverage ratio gauge for mask inspection
+
+See the README files under `tools/registration/` and `tools/coverage/` for usage examples and screenshots.
 
 ---
 
@@ -21,30 +28,34 @@ If you also need **CT registration / manual QC visualization** for aligning pre/
 
 Key files/folders:
 
-```
-
+```text
 PGMNet/
-BoneAttentionUNetV2.py
-nnUNetTrainerBoneAttention.py
-scripts/
-batch_infer.py
-weights/
-nnunet_results/
-all_on/
-Dataset10077_MyTask/
-nnUNetTrainerBoneAttention__nnUNetPlans__3d_fullres/
-dataset.json
-dataset_fingerprint.json
-plans.json
-fold_0/checkpoint_best.pth
-fold_1/checkpoint_best.pth
-fold_2/checkpoint_best.pth
-fold_3/checkpoint_best.pth
-fold_4/checkpoint_best.pth
-
+  BoneAttentionUNetV2.py
+  nnUNetTrainerBoneAttention.py
+  scripts/
+    batch_infer.py
+  tools/
+    registration/
+      ct_reg_bone_mi.py
+      napari_manual_qc.py
+    coverage/
+      napari_coverage_viewer.py
+  weights/
+    nnunet_results/
+      all_on/
+        Dataset10077_MyTask/
+          nnUNetTrainerBoneAttention__nnUNetPlans__3d_fullres/
+            dataset.json
+            dataset_fingerprint.json
+            plans.json
+            fold_0/checkpoint_best.pth
+            fold_1/checkpoint_best.pth
+            fold_2/checkpoint_best.pth
+            fold_3/checkpoint_best.pth
+            fold_4/checkpoint_best.pth
 ````
 
-**Important**: nnU-Net v2 requires `dataset.json` (and typically `plans.json` / fingerprint) to be present in the model folder for inference. This repo includes these files.
+**Important:** nnU-Net v2 requires `dataset.json` (and typically `plans.json` / fingerprint) to be present in the model folder for inference. This repo includes these files.
 
 ---
 
@@ -52,12 +63,12 @@ fold_4/checkpoint_best.pth
 
 The code and inference pipeline were tested on:
 
-- **OS**: Linux
-- **Python**: 3.9.23
-- **PyTorch**: 2.5.1+cu121
-- **CUDA (PyTorch build)**: 12.1
-- **nnU-Net v2**: 2.5.2
-- **GPU**: NVIDIA GeForce RTX 4070 (multi-GPU supported)
+* **OS**: Linux
+* **Python**: 3.9.23
+* **PyTorch**: 2.5.1+cu121
+* **CUDA (PyTorch build)**: 12.1
+* **nnU-Net v2**: 2.5.2
+* **GPU**: NVIDIA GeForce RTX 4070 (multi-GPU supported)
 
 > Note: Your NVIDIA driver CUDA version can be higher than the PyTorch CUDA build (e.g., driver shows CUDA 12.8 while PyTorch is cu121). This is normal as long as the driver supports the CUDA runtime required by PyTorch.
 
@@ -71,10 +82,10 @@ If the repository uses Git LFS for `.pth` files, install LFS and pull weights:
 
 ```bash
 git lfs install
-git clone https://github.com/a03801/PGMNet.git
+git clone https://github.com/jiejiecc/PGMNet.git
 cd PGMNet
 git lfs pull
-````
+```
 
 If you do not use Git LFS, normal `git clone` is enough.
 
@@ -147,14 +158,13 @@ Weights are stored under `weights/nnunet_results/` in the standard nnU-Net v2 re
 ## Input format
 
 * Input must be **NIfTI**: `*.nii.gz`
-* The script processes **subfolders** under `--input_root`
-  (each subfolder is treated as one inference batch/case-group).
+* The script processes **subfolders** under `--input_root` (each subfolder is treated as one inference batch/case-group).
 * nnU-Net expects modality suffix `_0000.nii.gz`.
   The script automatically renames `*.nii.gz` to `*_0000.nii.gz` if needed.
 
 Example input structure:
 
-```
+```text
 /path/to/input_root/
   caseA/
     caseA.nii.gz
@@ -196,7 +206,7 @@ python scripts/batch_infer.py \
 
 Outputs will be written to:
 
-```
+```text
 outputs/
   caseA_pred/
   caseB_pred/
@@ -218,13 +228,6 @@ To view all supported options:
 ```bash
 python scripts/batch_infer.py -h
 ```
-
-Common options include:
-
-* `--gpus 0,1,2` (comma-separated GPU IDs)
-* `--save_prob` / `--disable_tta`
-* `--dataset_id`, `--dataset_name`, `--trainer`, `--plans`, `--config`, `--checkpoint`
-* `--weights_root` and `--experiment` (recommended to keep default repo layout)
 
 ---
 
@@ -284,6 +287,8 @@ If you use this repository, please cite the associated manuscript (to be updated
 ````
 
 ---
+
+
 
 
 
