@@ -10,9 +10,12 @@ This module defines a **reproducible** workflow for:
 
 ---
 
-![Preview](assets/001_1.png)
-
-
+<p align="center">
+  <img src="../../assets/001_2.png" height="520" />
+  <img src="../../assets/001_1.png" height="520" />
+  <img src="../../assets/001_3.png" height="520" />
+  <img src="../../assets/001_4.png" height="220" />
+</p>
 
 
 
