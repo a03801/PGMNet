@@ -282,7 +282,7 @@ See `LICENSE`.
 
 ## Citation (PGMNet)
 
-If you use this repository, please cite the associated manuscript (to be updated after acceptance).
+If you use this repository, please cite the associated manuscript (Chen, Xingyu and Cai, Jie and Yu, Zhongzheng and Wu, Junxue and Li, Bin and Gao, Chuanbo and Yu, Xiaojun and Li, Hongfei and Lv, Kehan and Li, Yunan and Li, Haiyan and Zhang, Xijiao and Zhang, Hu and Li, Hangyu and Liu, Guohao and Zhang, Wei and Zhu, Hanxiao and Xu, Yongqing and Zhu, Yueliang and Xie, Zhao and Song, Muguo and Shi, Jian, Surgical Margin Quantification Enables Actionable Quality Control in Osteomyelitis Debridement: A Multicentre, Retrospective, Deep Learning Study. Available at SSRN: https://ssrn.com/abstract=6186511 or http://dx.doi.org/10.2139/ssrn.6186511).
 
 ````
 
