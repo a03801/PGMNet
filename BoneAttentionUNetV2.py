@@ -1,46 +1,3 @@
-"""
-PGMNet network implementation aligned to the final Supplementary Methods.
-
-Manuscript-defined components
------------------------------
-1. APGM: Adaptive Prior Guidance Module
-   - separate HU-domain normalization: clamp raw/reconstructed HU to [-200, 1800] and scale to [0, 1]
-   - patient-specific bone-density prior:
-       u_low = 0.18
-       u_high = min(0.90, 95th percentile of I_norm)
-       P_bone = clamp((I_norm-u_low)/(u_high-u_low), 0, 1)
-   - local texture-complexity prior from 3x3x3 local variance:
-       P_texture = sigmoid(k * (local_variance - mu_sigma))
-     with learnable k and mu_sigma
-   - optional 5x5x5 average smoothing of P_bone
-   - concatenated priors are adaptively gated before PGFM
-2. PGFM: Prior-Guided Feature Modulator
-   - fully connected channel gate from target feature + prior summaries
-   - prior-guided attention: Q from target features; K,V from prior features
-   - gated fusion with the original feature map
-3. VMA: Voxel-level Multi-dimensional Attention
-   - grouped feature processing
-   - D/H/W directional adaptive pooling and cross-dimensional interaction
-   - GroupNorm gated branch + 3x3x3 local branch
-   - bidirectional cross-attention weighting
-4. MSFE: Mixed-Scale Feature Enhancer
-   - LocalAgg with depthwise 9x9x9 positional/local attention, InstanceNorm and conv-MLP
-   - sparse SelfAttn using AvgPool3d, scaled dot-product attention and depthwise ConvTranspose3d upsampling
-
-Backbone
---------
-Six 3D stages with channels (32, 64, 128, 256, 320, 320), 3x3x3 convolutions,
-InstanceNorm3d, LeakyReLU and no dropout. The default strides yield spatial sizes
-96 -> 48 -> 24 -> 12 -> 6 -> 3 for a 96^3 patch.
-
-Important reproducibility note
-------------------------------
-This file is a manuscript-aligned reference implementation. It must not be described
-as the exact historical training code unless the reported checkpoints/results were
-actually produced with this implementation (or are shown to be state-dict/behavior
-compatible). A 5-stage checkpoint is not expected to load strictly into this 6-stage model.
-"""
-
 from __future__ import annotations
 
 import math
@@ -81,18 +38,8 @@ class DoubleConvINLeaky(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# APGM: manuscript equations (1)-(4)
+# APGM
 # -----------------------------------------------------------------------------
-class AdaptivePriorGuidanceModule(nn.Module):
-    """Adaptive Prior Guidance Module (APGM).
-
-    The network input produced by nnU-Net is normally CT-normalized. To construct the
-    manuscript-specified HU-domain priors without replacing standard nnU-Net input
-    preprocessing, APGM reconstructs the clipped HU scale from the nnU-Net normalized
-    first channel using the CT normalization mean/std supplied by the trainer.
-
-    If the caller supplies raw_hu explicitly, raw_hu is used directly.
-    """
 
     def __init__(
         self,
@@ -189,7 +136,7 @@ class AdaptivePriorGuidanceModule(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# PGFM: gated modulation + prior-guided Q/K/V attention + gated fusion
+# PGFM
 # -----------------------------------------------------------------------------
 class PriorGuidedFeatureModulator(nn.Module):
     def __init__(self, channels: int, prior_channels: int = 2, reduction: int = 4, token_grid: int = 4):
@@ -259,7 +206,7 @@ class PriorGuidedFeatureModulator(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# VMA: equations (6)-(12)
+# VMA
 # -----------------------------------------------------------------------------
 class VMA(nn.Module):
     def __init__(self, channels: int, factor: int = 32):
@@ -322,7 +269,7 @@ class VMA(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# MSFE: LocalAgg + sparse SelfAttn, equations (13)-(16)
+# MSFE
 # -----------------------------------------------------------------------------
 class ConvMLP3D(nn.Module):
     def __init__(self, channels: int, mlp_ratio: float = 4.0):
@@ -449,13 +396,7 @@ class LKLGLBlock(nn.Module):
 
 
 class MixedScaleFeatureEnhancer(nn.Module):
-    """MSFE bottleneck consistent with the Supplementary Note.
-
-    The first stack uses local aggregation + sparse global attention (sr_ratio=2).
-    Features are then expanded to 384 channels and refined at full resolution
-    (sr_ratio=1), before being reduced back to 320 channels.
-    """
-
+   
     def __init__(self, channels: int = 320, expanded_channels: int = 384, depth: int = 3):
         super().__init__()
         h1 = max(1, channels // 64)
@@ -492,7 +433,6 @@ class PGMStage(nn.Module):
 
 
 class BoneAttentionUNetForNNUNet(nn.Module):
-    """PGMNet manuscript-aligned network used by nnUNetTrainerBoneAttention."""
 
     def __init__(
         self,
@@ -548,7 +488,6 @@ class BoneAttentionUNetForNNUNet(nn.Module):
                     else nn.Conv3d(ch, ch, kernel_size=s, stride=s, bias=False)
                 )
 
-        # MSFE at the deepest 320-channel stage.
         self.msfe = MixedScaleFeatureEnhancer(channels=320, expanded_channels=384, depth=3)
 
         # Decoder + PGFM.
@@ -623,11 +562,6 @@ class BoneAttentionUNetForNNUNet(nn.Module):
         for feat, head in zip(decoder_feats, self.ds_convs):
             outputs.append(head(feat))
         return outputs
-
-
-# Alias used by external code / manuscript naming.
-PGMNet = BoneAttentionUNetForNNUNet
-
 
 if __name__ == "__main__":
     # Lightweight architectural smoke test independent of nnU-Net.
