@@ -1,23 +1,20 @@
 from __future__ import annotations
 
 import math
-from functools import partial
-from typing import List, Optional, Sequence, Tuple
+import weakref
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-# -----------------------------------------------------------------------------
-# Backbone primitives: 3x3x3 Conv + InstanceNorm3d + LeakyReLU, no dropout
-# -----------------------------------------------------------------------------
 class ConvINLeaky(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, stride: Tuple[int, int, int] = (1, 1, 1)):
+    def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
         self.block = nn.Sequential(
-            nn.Conv3d(in_ch, out_ch, 3, stride=stride, padding=1, bias=True),
-            nn.InstanceNorm3d(out_ch, affine=True),
+            nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1, bias=True),
+            nn.InstanceNorm3d(out_channels, affine=True),
             nn.LeakyReLU(negative_slope=1e-2, inplace=True),
         )
 
@@ -26,21 +23,18 @@ class ConvINLeaky(nn.Module):
 
 
 class DoubleConvINLeaky(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int):
+    def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
         self.block = nn.Sequential(
-            ConvINLeaky(in_ch, out_ch),
-            ConvINLeaky(out_ch, out_ch),
+            ConvINLeaky(in_channels, out_channels),
+            ConvINLeaky(out_channels, out_channels),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.block(x)
 
 
-# -----------------------------------------------------------------------------
-# APGM
-# -----------------------------------------------------------------------------
-
+class AdaptivePriorGuidanceModule(nn.Module):
     def __init__(
         self,
         ct_mean: float = 0.0,
@@ -64,67 +58,71 @@ class DoubleConvINLeaky(nn.Module):
         self.upper_quantile = float(upper_quantile)
         self.smooth_bone_prior = bool(smooth_bone_prior)
 
-        # Manuscript: k and mu_sigma are learnable parameters.
-        # Positive k is enforced with softplus; mu_sigma is unconstrained and learned.
-        self.texture_k_raw = nn.Parameter(torch.tensor(float(texture_k_init)).log().clamp_min(-10.0))
+        self.texture_k_raw = nn.Parameter(torch.log(torch.tensor(float(texture_k_init))))
         self.texture_mu_sigma = nn.Parameter(torch.tensor(float(texture_mu_init)))
-
-        # Adaptive prior fusion gate; BatchNorm is restricted to this prior-fusion submodule,
-        # while the segmentation backbone itself uses InstanceNorm3d as reported.
         self.prior_fusion = nn.Sequential(
             nn.Conv3d(2, 2, kernel_size=1, bias=True),
             nn.BatchNorm3d(2),
             nn.Sigmoid(),
         )
 
-    def _recover_hu(self, x: torch.Tensor, raw_hu: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def set_ct_normalization_statistics(self, mean: float, std: float) -> None:
+        if std <= 0:
+            raise ValueError("CT standard deviation must be positive")
+        self.ct_mean.fill_(float(mean))
+        self.ct_std.fill_(float(std))
+
+    def _recover_hu(self, x: torch.Tensor, raw_hu: Optional[torch.Tensor]) -> torch.Tensor:
         if raw_hu is not None:
-            if raw_hu.ndim != 5:
-                raise ValueError(f"raw_hu must be [B,C,D,H,W], got {tuple(raw_hu.shape)}")
+            if raw_hu.ndim != 5 or raw_hu.shape[0] != x.shape[0]:
+                raise ValueError("raw_hu must have shape [B, C, D, H, W] and match the batch size")
             return raw_hu[:, :1].float()
-        # Invert standard CT z-normalization for the first channel.
         return x[:, :1].float() * self.ct_std + self.ct_mean
 
     @staticmethod
     def _local_variance(x: torch.Tensor, kernel_size: int = 3) -> torch.Tensor:
-        pad = kernel_size // 2
-        mean = F.avg_pool3d(x, kernel_size=kernel_size, stride=1, padding=pad)
-        mean_sq = F.avg_pool3d(x * x, kernel_size=kernel_size, stride=1, padding=pad)
-        return (mean_sq - mean * mean).clamp_min(0.0)
+        padding = kernel_size // 2
+        mean = F.avg_pool3d(x, kernel_size=kernel_size, stride=1, padding=padding)
+        mean_sq = F.avg_pool3d(x.square(), kernel_size=kernel_size, stride=1, padding=padding)
+        return (mean_sq - mean.square()).clamp_min(0.0)
 
     def forward(
         self,
         x_nnunet: torch.Tensor,
         raw_hu: Optional[torch.Tensor] = None,
+        u_high: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
-        hu = self._recover_hu(x_nnunet, raw_hu=raw_hu)
-
-        # Equation (1): independent APGM HU normalization.
+        hu = self._recover_hu(x_nnunet, raw_hu)
         i_norm = torch.clamp(hu, float(self.hu_min), float(self.hu_max))
         i_norm = (i_norm - self.hu_min) / (self.hu_max - self.hu_min + 1e-6)
 
-        # Patient-specific thresholds in normalized space.
-        b = i_norm.shape[0]
-        q95 = torch.quantile(i_norm.reshape(b, -1), self.upper_quantile, dim=1)
-        q95 = q95.view(b, 1, 1, 1, 1)
-        u_high = torch.minimum(q95, self.u_high_cap)
+        batch_size = i_norm.shape[0]
+        if u_high is None:
+            q95 = torch.quantile(i_norm.reshape(batch_size, -1), self.upper_quantile, dim=1)
+            u_high = q95.view(batch_size, 1, 1, 1, 1)
+        else:
+            u_high = torch.as_tensor(u_high, dtype=i_norm.dtype, device=i_norm.device)
+            if u_high.ndim == 0:
+                u_high = u_high.repeat(batch_size)
+            if u_high.numel() != batch_size:
+                raise ValueError("u_high must contain one value per batch element")
+            u_high = u_high.reshape(batch_size, 1, 1, 1, 1)
+
+        u_high = torch.minimum(u_high, self.u_high_cap)
         u_high = torch.maximum(u_high, self.u_low + 1e-4)
 
-        # Equation (2): bone-density prior.
         p_bone = ((i_norm - self.u_low) / (u_high - self.u_low + 1e-6)).clamp(0.0, 1.0)
         if self.smooth_bone_prior:
             p_bone = F.avg_pool3d(p_bone, kernel_size=5, stride=1, padding=2)
 
-        # Equation (3): local texture-complexity prior, local variance in 3x3x3 neighborhood.
         sigma2_local = self._local_variance(i_norm, kernel_size=3)
         k = F.softplus(self.texture_k_raw) + 1e-6
         p_texture = torch.sigmoid(k * (sigma2_local - self.texture_mu_sigma))
 
-        # Equation (4): concatenate patient-specific priors, then adaptively gate them.
-        p = torch.cat([p_bone, p_texture], dim=1)
-        p = p * self.prior_fusion(p)
+        priors = torch.cat([p_bone, p_texture], dim=1)
+        priors = priors * self.prior_fusion(priors)
 
-        aux = {
+        return priors, {
             "i_norm": i_norm,
             "p_bone": p_bone,
             "p_texture": p_texture,
@@ -132,42 +130,32 @@ class DoubleConvINLeaky(nn.Module):
             "texture_k": k.detach(),
             "texture_mu_sigma": self.texture_mu_sigma.detach(),
         }
-        return p, aux
 
 
-# -----------------------------------------------------------------------------
-# PGFM
-# -----------------------------------------------------------------------------
 class PriorGuidedFeatureModulator(nn.Module):
     def __init__(self, channels: int, prior_channels: int = 2, reduction: int = 4, token_grid: int = 4):
         super().__init__()
         hidden = max(8, channels // reduction)
         attn_dim = max(8, min(64, channels // 4))
-        self.channels = channels
+        self.channels = int(channels)
         self.token_grid = int(token_grid)
-        self.attn_dim = attn_dim
+        self.attn_dim = int(attn_dim)
 
         self.prior_proj = nn.Sequential(
-            nn.Conv3d(prior_channels, channels, 1, bias=True),
+            nn.Conv3d(prior_channels, channels, kernel_size=1, bias=True),
             nn.InstanceNorm3d(channels, affine=True),
             nn.LeakyReLU(1e-2, inplace=True),
         )
-
-        # Fully connected channel gate from pooled target + prior features.
         self.gate_fc = nn.Sequential(
             nn.Linear(channels * 2, hidden),
             nn.LeakyReLU(1e-2, inplace=True),
             nn.Linear(hidden, channels),
             nn.Sigmoid(),
         )
-
-        # Q from target features; K,V from prior-guided features.
-        self.q_proj = nn.Conv3d(channels, attn_dim, 1, bias=False)
-        self.k_proj = nn.Conv3d(channels, attn_dim, 1, bias=False)
-        self.v_proj = nn.Conv3d(channels, channels, 1, bias=False)
-        self.attn_out = nn.Conv3d(channels, channels, 1, bias=True)
-
-        # Final gated fusion with the original target feature.
+        self.q_proj = nn.Conv3d(channels, attn_dim, kernel_size=1, bias=False)
+        self.k_proj = nn.Conv3d(channels, attn_dim, kernel_size=1, bias=False)
+        self.v_proj = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
+        self.attn_out = nn.Conv3d(channels, channels, kernel_size=1, bias=True)
         self.fusion_fc = nn.Sequential(
             nn.Linear(channels * 2, hidden),
             nn.LeakyReLU(1e-2, inplace=True),
@@ -177,108 +165,91 @@ class PriorGuidedFeatureModulator(nn.Module):
 
     def _pool_tokens(self, x: torch.Tensor) -> torch.Tensor:
         d, h, w = x.shape[2:]
-        td, th, tw = min(self.token_grid, d), min(self.token_grid, h), min(self.token_grid, w)
-        return F.adaptive_avg_pool3d(x, (td, th, tw))
+        size = (min(self.token_grid, d), min(self.token_grid, h), min(self.token_grid, w))
+        return F.adaptive_avg_pool3d(x, size)
 
     def forward(self, x: torch.Tensor, priors: torch.Tensor) -> torch.Tensor:
-        priors_r = F.interpolate(priors, size=x.shape[2:], mode="trilinear", align_corners=False)
-        p_feat = self.prior_proj(priors_r)
+        priors = F.interpolate(priors, size=x.shape[2:], mode="trilinear", align_corners=False)
+        p_feat = self.prior_proj(priors)
 
         x_gap = F.adaptive_avg_pool3d(x, 1).flatten(1)
         p_gap = F.adaptive_avg_pool3d(p_feat, 1).flatten(1)
-        channel_gate = self.gate_fc(torch.cat([x_gap, p_gap], dim=1)).view(x.shape[0], self.channels, 1, 1, 1)
-        gated_prior = p_feat * channel_gate
+        channel_gate = self.gate_fc(torch.cat([x_gap, p_gap], dim=1))
+        channel_gate = channel_gate.view(x.shape[0], self.channels, 1, 1, 1)
+        p_feat = p_feat * channel_gate
 
-        q = self._pool_tokens(self.q_proj(x)).flatten(2).transpose(1, 2)          # [B,N,Ca]
-        k = self._pool_tokens(self.k_proj(gated_prior)).flatten(2)               # [B,Ca,N]
-        v_map = self._pool_tokens(self.v_proj(gated_prior))
-        v = v_map.flatten(2).transpose(1, 2)                                     # [B,N,C]
+        q = self._pool_tokens(self.q_proj(x)).flatten(2).transpose(1, 2)
+        k = self._pool_tokens(self.k_proj(p_feat)).flatten(2)
+        v_map = self._pool_tokens(self.v_proj(p_feat))
+        v = v_map.flatten(2).transpose(1, 2)
 
         attn = torch.softmax(torch.matmul(q, k) / math.sqrt(float(self.attn_dim)), dim=-1)
-        attn_tokens = torch.matmul(attn, v).transpose(1, 2)
-        attn_low = attn_tokens.reshape(v_map.shape[0], self.channels, *v_map.shape[2:])
-        attn_full = F.interpolate(attn_low, size=x.shape[2:], mode="trilinear", align_corners=False)
-        guided = x + self.attn_out(attn_full) + gated_prior
+        guided_tokens = torch.matmul(attn, v).transpose(1, 2)
+        guided_low = guided_tokens.reshape(v_map.shape[0], self.channels, *v_map.shape[2:])
+        guided_full = F.interpolate(guided_low, size=x.shape[2:], mode="trilinear", align_corners=False)
+        guided = x + self.attn_out(guided_full) + p_feat
 
         guided_gap = F.adaptive_avg_pool3d(guided, 1).flatten(1)
-        fusion_gate = self.fusion_fc(torch.cat([x_gap, guided_gap], dim=1)).view(x.shape[0], self.channels, 1, 1, 1)
+        fusion_gate = self.fusion_fc(torch.cat([x_gap, guided_gap], dim=1))
+        fusion_gate = fusion_gate.view(x.shape[0], self.channels, 1, 1, 1)
         return x * (1.0 - fusion_gate) + guided * fusion_gate
 
 
-# -----------------------------------------------------------------------------
-# VMA
-# -----------------------------------------------------------------------------
 class VMA(nn.Module):
     def __init__(self, channels: int, factor: int = 32):
         super().__init__()
-        # Use the largest valid group count <= factor so every reported channel width works.
-        groups = min(int(factor), channels)
+        groups = min(int(factor), int(channels))
         while channels % groups != 0:
             groups -= 1
         self.groups = groups
-        cpg = channels // groups
+        channels_per_group = channels // groups
 
         self.softmax = nn.Softmax(dim=-1)
         self.pool_d = nn.AdaptiveAvgPool3d((None, 1, 1))
         self.pool_h = nn.AdaptiveAvgPool3d((1, None, 1))
         self.pool_w = nn.AdaptiveAvgPool3d((1, 1, None))
         self.global_pool = nn.AdaptiveAvgPool3d(1)
-        self.gn = nn.GroupNorm(cpg, cpg)
-        self.conv1x1 = nn.Conv3d(cpg, cpg, 1, bias=True)
-        self.conv3x3 = nn.Conv3d(cpg, cpg, 3, padding=1, bias=True)
-        self.last_attn_weights: Optional[torch.Tensor] = None
+        self.group_norm = nn.GroupNorm(channels_per_group, channels_per_group)
+        self.cross_conv = nn.Conv3d(channels_per_group, channels_per_group, kernel_size=1, bias=True)
+        self.local_conv = nn.Conv3d(channels_per_group, channels_per_group, kernel_size=3, padding=1, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, d, h, w = x.shape
         g = self.groups
         cpg = c // g
+        x_group = x.reshape(b * g, cpg, d, h, w)
 
-        # Eq. (6)
-        xg = x.reshape(b * g, cpg, d, h, w)
+        x_d = self.pool_d(x_group)
+        x_h = self.pool_h(x_group).permute(0, 1, 3, 2, 4)
+        x_w = self.pool_w(x_group).permute(0, 1, 4, 3, 2)
+        cross = self.cross_conv(torch.cat([x_d, x_h, x_w], dim=2))
+        x_d, x_h, x_w = torch.split(cross, [d, h, w], dim=2)
 
-        # Eq. (7): directional pooling.
-        xd = self.pool_d(xg)                                     # [BG,Cg,D,1,1]
-        xh = self.pool_h(xg).permute(0, 1, 3, 2, 4)              # [BG,Cg,H,1,1]
-        xw = self.pool_w(xg).permute(0, 1, 4, 3, 2)              # [BG,Cg,W,1,1]
-
-        # Eq. (8): cross-dimensional interaction and redistribution.
-        fcross = self.conv1x1(torch.cat([xd, xh, xw], dim=2))
-        xd_new, xh_new, xw_new = torch.split(fcross, [d, h, w], dim=2)
-
-        # Eq. (9): multidimensional gated enhancement + GroupNorm.
-        f1 = self.gn(
-            xg
-            * torch.sigmoid(xd_new)
-            * torch.sigmoid(xh_new.permute(0, 1, 3, 2, 4))
-            * torch.sigmoid(xw_new.permute(0, 1, 4, 3, 2))
+        f1 = self.group_norm(
+            x_group
+            * torch.sigmoid(x_d)
+            * torch.sigmoid(x_h.permute(0, 1, 3, 2, 4))
+            * torch.sigmoid(x_w.permute(0, 1, 4, 3, 2))
         )
+        f2 = self.local_conv(x_group)
 
-        # Eq. (11) local contextual branch; Eq. (10)/(11) channel weights.
-        f2 = self.conv3x3(xg)
         w1 = self.softmax(self.global_pool(f1).reshape(b * g, 1, cpg))
         w2 = self.softmax(self.global_pool(f2).reshape(b * g, 1, cpg))
-        f2_flat = f2.reshape(b * g, cpg, -1)
-        f1_flat = f1.reshape(b * g, cpg, -1)
-
-        # Eq. (12): bidirectional cross-attention and voxel weighting.
-        wfinal = torch.matmul(w1, f2_flat) + torch.matmul(w2, f1_flat)
-        wfinal = wfinal.reshape(b * g, 1, d, h, w)
-        spatial_weight = torch.sigmoid(wfinal)
-        self.last_attn_weights = spatial_weight.detach()
-        return (xg * spatial_weight).reshape(b, c, d, h, w)
+        raw_weight = torch.matmul(w1, f2.reshape(b * g, cpg, -1))
+        raw_weight = raw_weight + torch.matmul(w2, f1.reshape(b * g, cpg, -1))
+        w_final = torch.sigmoid(raw_weight).reshape(b * g, 1, d, h, w)
+        spatial_weight = torch.sigmoid(w_final)
+        return (x_group * spatial_weight).reshape(b, c, d, h, w)
 
 
-# -----------------------------------------------------------------------------
-# MSFE
-# -----------------------------------------------------------------------------
 class ConvMLP3D(nn.Module):
     def __init__(self, channels: int, mlp_ratio: float = 4.0):
         super().__init__()
         hidden = int(channels * mlp_ratio)
         self.net = nn.Sequential(
-            nn.Conv3d(channels, hidden, 1, bias=True),
+            nn.Conv3d(channels, hidden, kernel_size=1, bias=True),
             nn.GELU(),
-            nn.Conv3d(hidden, channels, 1, bias=True),
+            nn.Conv3d(hidden, channels, kernel_size=1, bias=True),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -288,66 +259,59 @@ class ConvMLP3D(nn.Module):
 class LocalAgg(nn.Module):
     def __init__(self, dim: int, mlp_ratio: float = 4.0):
         super().__init__()
-        self.pos_embed = nn.Conv3d(dim, dim, 9, padding=4, groups=dim, bias=True)
+        self.pos_embed = nn.Conv3d(dim, dim, kernel_size=9, padding=4, groups=dim, bias=True)
         self.norm1 = nn.InstanceNorm3d(dim, affine=True)
-        self.conv1 = nn.Conv3d(dim, dim, 1, bias=True)
-        self.conv2 = nn.Conv3d(dim, dim, 1, bias=True)
-        self.local_attn = nn.Conv3d(dim, dim, 9, padding=4, groups=dim, bias=True)
+        self.pointwise = nn.Conv3d(dim, dim, kernel_size=1, bias=True)
+        self.local_attn = nn.Conv3d(dim, dim, kernel_size=9, padding=4, groups=dim, bias=True)
         self.norm2 = nn.InstanceNorm3d(dim, affine=True)
         self.mlp = ConvMLP3D(dim, mlp_ratio=mlp_ratio)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Supplement Eq. (13) and immediately surrounding LocalAgg equations.
-        xpos = x + x * (torch.sigmoid(self.pos_embed(x)) - 0.5)
-        xattn = xpos + xpos * (
-            torch.sigmoid(self.conv2(self.local_attn(self.conv1(self.norm1(xpos))))) - 0.5
+        x_pos = x + x * (torch.sigmoid(self.pos_embed(x)) - 0.5)
+        x_attn = x_pos + x_pos * (
+            torch.sigmoid(self.local_attn(self.pointwise(self.norm1(x_pos)))) - 0.5
         )
-        xout = xattn + xattn * (torch.sigmoid(self.mlp(self.norm2(xattn))) - 0.5)
-        return xout
+        return x_attn + x_attn * (torch.sigmoid(self.mlp(self.norm2(x_attn))) - 0.5)
 
 
-class GlobalSparseAttn(nn.Module):
+class GlobalSparseAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, sr_ratio: int = 1):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
-        self.dim = dim
-        self.num_heads = num_heads
+        self.dim = int(dim)
+        self.num_heads = int(num_heads)
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
         self.sr_ratio = int(sr_ratio)
         self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim, bias=True)
-        if self.sr_ratio > 1:
-            self.up = nn.ConvTranspose3d(
-                dim, dim, kernel_size=self.sr_ratio, stride=self.sr_ratio, groups=dim, bias=True
-            )
-        else:
-            self.up = nn.Identity()
+        self.up = (
+            nn.ConvTranspose3d(dim, dim, kernel_size=sr_ratio, stride=sr_ratio, groups=dim, bias=True)
+            if sr_ratio > 1
+            else nn.Identity()
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, d, h, w = x.shape
-        if self.sr_ratio > 1:
-            # Eq. (14): hierarchical average-pooling before Q/K/V.
-            pooled = F.avg_pool3d(x, kernel_size=self.sr_ratio, stride=self.sr_ratio)
-        else:
-            pooled = x
+        pooled = (
+            F.avg_pool3d(x, kernel_size=self.sr_ratio, stride=self.sr_ratio)
+            if self.sr_ratio > 1
+            else x
+        )
         pd, ph, pw = pooled.shape[2:]
 
-        tokens = pooled.flatten(2).transpose(1, 2)                  # [B,N,C]
+        tokens = pooled.flatten(2).transpose(1, 2)
         qkv = self.qkv(tokens).reshape(b, -1, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)
-        q = q.transpose(1, 2)                                      # [B,H,N,Dh]
+        q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        # Eq. (15): scaled dot-product attention.
         attn = torch.softmax(torch.matmul(q, k.transpose(-2, -1)) * self.scale, dim=-1)
         out = torch.matmul(attn, v).transpose(1, 2).reshape(b, -1, c)
-        out = self.proj(out)
-        out = out.transpose(1, 2).reshape(b, c, pd, ph, pw)
+        out = self.proj(out).transpose(1, 2).reshape(b, c, pd, ph, pw)
 
-        # Eq. (16): depthwise transposed-convolution upsampling to original resolution.
         if self.sr_ratio > 1:
             out = self.up(out)
             if out.shape[2:] != (d, h, w):
@@ -358,9 +322,9 @@ class GlobalSparseAttn(nn.Module):
 class SelfAttn(nn.Module):
     def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0, sr_ratio: int = 1):
         super().__init__()
-        self.pos_embed = nn.Conv3d(dim, dim, 3, padding=1, groups=dim, bias=True)
+        self.pos_embed = nn.Conv3d(dim, dim, kernel_size=3, padding=1, groups=dim, bias=True)
         self.norm1 = nn.LayerNorm(dim, eps=1e-6)
-        self.attn = GlobalSparseAttn(dim, num_heads=num_heads, sr_ratio=sr_ratio)
+        self.attn = GlobalSparseAttention(dim, num_heads=num_heads, sr_ratio=sr_ratio)
         self.norm2 = nn.LayerNorm(dim, eps=1e-6)
         self.mlp = nn.Sequential(
             nn.Linear(dim, int(dim * mlp_ratio)),
@@ -369,20 +333,18 @@ class SelfAttn(nn.Module):
         )
 
     @staticmethod
-    def _apply_ln(x: torch.Tensor, ln: nn.LayerNorm) -> torch.Tensor:
+    def _apply_layer_norm(x: torch.Tensor, norm: nn.LayerNorm) -> torch.Tensor:
         b, c, d, h, w = x.shape
-        t = x.flatten(2).transpose(1, 2)
-        t = ln(t)
-        return t.transpose(1, 2).reshape(b, c, d, h, w)
+        tokens = norm(x.flatten(2).transpose(1, 2))
+        return tokens.transpose(1, 2).reshape(b, c, d, h, w)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.pos_embed(x)
-        x = x + self.attn(self._apply_ln(x, self.norm1))
-
+        x = x + self.attn(self._apply_layer_norm(x, self.norm1))
         b, c, d, h, w = x.shape
-        t = x.flatten(2).transpose(1, 2)
-        t = t + self.mlp(self.norm2(t))
-        return t.transpose(1, 2).reshape(b, c, d, h, w)
+        tokens = x.flatten(2).transpose(1, 2)
+        tokens = tokens + self.mlp(self.norm2(tokens))
+        return tokens.transpose(1, 2).reshape(b, c, d, h, w)
 
 
 class LKLGLBlock(nn.Module):
@@ -396,44 +358,52 @@ class LKLGLBlock(nn.Module):
 
 
 class MixedScaleFeatureEnhancer(nn.Module):
-   
     def __init__(self, channels: int = 320, expanded_channels: int = 384, depth: int = 3):
         super().__init__()
-        h1 = max(1, channels // 64)
-        h2 = max(1, expanded_channels // 64)
+        heads_sparse = max(1, channels // 64)
+        heads_full = max(1, expanded_channels // 64)
         self.sparse_blocks = nn.ModuleList(
-            [LKLGLBlock(channels, num_heads=h1, mlp_ratio=4.0, sr_ratio=2) for _ in range(depth)]
+            [LKLGLBlock(channels, heads_sparse, mlp_ratio=4.0, sr_ratio=2) for _ in range(depth)]
         )
         self.expand = DoubleConvINLeaky(channels, expanded_channels)
         self.full_blocks = nn.ModuleList(
-            [LKLGLBlock(expanded_channels, num_heads=h2, mlp_ratio=4.0, sr_ratio=1) for _ in range(depth)]
+            [LKLGLBlock(expanded_channels, heads_full, mlp_ratio=4.0, sr_ratio=1) for _ in range(depth)]
         )
         self.reduce = DoubleConvINLeaky(expanded_channels, channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for blk in self.sparse_blocks:
-            x = blk(x)
+        for block in self.sparse_blocks:
+            x = block(x)
         x = self.expand(x)
-        for blk in self.full_blocks:
-            x = blk(x)
+        for block in self.full_blocks:
+            x = block(x)
         return self.reduce(x)
 
 
-# -----------------------------------------------------------------------------
-# Six-stage PGMNet encoder-decoder
-# -----------------------------------------------------------------------------
 class PGMStage(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, use_vma: bool = True):
+    def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
-        self.conv = DoubleConvINLeaky(in_ch, out_ch)
-        self.vma = VMA(out_ch, factor=32) if use_vma else nn.Identity()
+        self.conv = DoubleConvINLeaky(in_channels, out_channels)
+        self.vma = VMA(out_channels, factor=32)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.vma(self.conv(x))
 
 
-class BoneAttentionUNetForNNUNet(nn.Module):
+class _DecoderControl:
+    def __init__(self, owner: "BoneAttentionUNetForNNUNet"):
+        self._owner = weakref.proxy(owner)
 
+    @property
+    def deep_supervision(self) -> bool:
+        return bool(self._owner.deep_supervision)
+
+    @deep_supervision.setter
+    def deep_supervision(self, enabled: bool) -> None:
+        self._owner.deep_supervision = bool(enabled)
+
+
+class BoneAttentionUNetForNNUNet(nn.Module):
     def __init__(
         self,
         in_channels: int,
@@ -448,135 +418,103 @@ class BoneAttentionUNetForNNUNet(nn.Module):
             (2, 2, 2),
         ),
         deep_supervision: bool = True,
-        max_ds_outputs: int = 4,
         ct_mean: float = 0.0,
         ct_std: float = 1.0,
     ):
         super().__init__()
-        expected = (32, 64, 128, 256, 320, 320)
-        if tuple(feature_map_sizes) != expected:
-            raise ValueError(
-                f"Manuscript-aligned PGMNet requires six stages {expected}, got {tuple(feature_map_sizes)}"
-            )
-        if len(strides) == len(feature_map_sizes) - 1:
-            strides = ((1, 1, 1),) + tuple(strides)
+        expected_features = (32, 64, 128, 256, 320, 320)
+        if tuple(feature_map_sizes) != expected_features:
+            raise ValueError(f"PGMNet requires feature widths {expected_features}")
         if len(strides) != len(feature_map_sizes):
-            raise ValueError("strides must contain one entry per stage, including stage-0 stride (1,1,1)")
+            raise ValueError("strides must contain one entry for each network stage")
+        if tuple(strides[0]) != (1, 1, 1):
+            raise ValueError("the first-stage stride must be (1, 1, 1)")
 
         self.deep_supervision = bool(deep_supervision)
-        self.max_ds_outputs = int(max_ds_outputs)
-        self.feature_map_sizes = tuple(feature_map_sizes)
+        self.feature_map_sizes = tuple(int(v) for v in feature_map_sizes)
         self.strides = tuple(tuple(int(v) for v in s) for s in strides)
-
-        # APGM always enabled in the final architecture.
         self.apgm = AdaptivePriorGuidanceModule(ct_mean=ct_mean, ct_std=ct_std)
 
-        # Encoder: PGMNet stages + PGFM.
         self.encoders = nn.ModuleList()
-        self.pgfms_enc = nn.ModuleList()
+        self.encoder_pgfms = nn.ModuleList()
         self.down_ops = nn.ModuleList()
-        prev = in_channels
-        for i, ch in enumerate(self.feature_map_sizes):
-            self.encoders.append(PGMStage(prev, ch, use_vma=True))
-            self.pgfms_enc.append(PriorGuidedFeatureModulator(ch, prior_channels=2))
-            prev = ch
+        previous_channels = int(in_channels)
+        for i, channels in enumerate(self.feature_map_sizes):
+            self.encoders.append(PGMStage(previous_channels, channels))
+            self.encoder_pgfms.append(PriorGuidedFeatureModulator(channels, prior_channels=2))
+            previous_channels = channels
             if i < len(self.feature_map_sizes) - 1:
-                s = self.strides[i + 1]
-                self.down_ops.append(
-                    nn.MaxPool3d(kernel_size=s, stride=s)
-                    if s == (2, 2, 2)
-                    else nn.Conv3d(ch, ch, kernel_size=s, stride=s, bias=False)
-                )
+                stride = self.strides[i + 1]
+                if stride == (2, 2, 2):
+                    self.down_ops.append(nn.MaxPool3d(kernel_size=2, stride=2))
+                else:
+                    self.down_ops.append(nn.Conv3d(channels, channels, kernel_size=stride, stride=stride, bias=False))
 
         self.msfe = MixedScaleFeatureEnhancer(channels=320, expanded_channels=384, depth=3)
 
-        # Decoder + PGFM.
         self.up_ops = nn.ModuleList()
         self.decoders = nn.ModuleList()
-        self.pgfms_dec = nn.ModuleList()
+        self.decoder_pgfms = nn.ModuleList()
         decoder_channels: List[int] = []
         for i in range(len(self.feature_map_sizes) - 1, 0, -1):
             in_ch = self.feature_map_sizes[i]
             out_ch = self.feature_map_sizes[i - 1]
-            s = self.strides[i]
-            if s == (2, 2, 2):
+            stride = self.strides[i]
+            if stride == (2, 2, 2):
                 self.up_ops.append(nn.ConvTranspose3d(in_ch, out_ch, kernel_size=2, stride=2))
             else:
                 self.up_ops.append(
                     nn.Sequential(
-                        nn.Upsample(scale_factor=s, mode="trilinear", align_corners=False),
-                        nn.Conv3d(in_ch, out_ch, 1, bias=True),
+                        nn.Upsample(scale_factor=stride, mode="trilinear", align_corners=False),
+                        nn.Conv3d(in_ch, out_ch, kernel_size=1, bias=True),
                     )
                 )
-            self.decoders.append(PGMStage(out_ch * 2, out_ch, use_vma=True))
-            self.pgfms_dec.append(PriorGuidedFeatureModulator(out_ch, prior_channels=2))
+            self.decoders.append(PGMStage(out_ch * 2, out_ch))
+            self.decoder_pgfms.append(PriorGuidedFeatureModulator(out_ch, prior_channels=2))
             decoder_channels.append(out_ch)
 
-        self.final_conv = nn.Conv3d(self.feature_map_sizes[0], num_classes, 1)
+        self.final_conv = nn.Conv3d(self.feature_map_sizes[0], num_classes, kernel_size=1)
+        self.deep_supervision_heads = nn.ModuleList(
+            [nn.Conv3d(ch, num_classes, kernel_size=1) for ch in decoder_channels[:-1]]
+        )
+        self.decoder = _DecoderControl(self)
 
-        # Full-resolution output + up to 3 auxiliary outputs = 4 deep-supervision outputs.
-        if self.deep_supervision:
-            aux_channels = decoder_channels[: max(0, self.max_ds_outputs - 1)]
-            self.ds_convs = nn.ModuleList([nn.Conv3d(ch, num_classes, 1) for ch in aux_channels])
-        else:
-            self.ds_convs = None
-
-        # nnU-Net compatibility proxy.
-        class _DecoderProxy:
-            pass
-        self.decoder = _DecoderProxy()
-        self.decoder.deep_supervision = self.deep_supervision
-
-    def forward(self, x: torch.Tensor, raw_hu: Optional[torch.Tensor] = None):
-        priors, _ = self.apgm(x, raw_hu=raw_hu)
+    def forward(
+        self,
+        x: torch.Tensor,
+        raw_hu: Optional[torch.Tensor] = None,
+        u_high: Optional[torch.Tensor] = None,
+    ):
+        priors, _ = self.apgm(x, raw_hu=raw_hu, u_high=u_high)
 
         skips: List[torch.Tensor] = []
         z = x
-        for i, enc in enumerate(self.encoders):
-            z = enc(z)
-            z = self.pgfms_enc[i](z, priors)
+        for i, encoder in enumerate(self.encoders):
+            z = self.encoder_pgfms[i](encoder(z), priors)
             skips.append(z)
             if i < len(self.down_ops):
                 z = self.down_ops[i](z)
 
         z = self.msfe(z)
 
-        decoder_feats: List[torch.Tensor] = []
-        # skip the deepest feature because z already represents it
-        for j, (up, dec, pgfm) in enumerate(zip(self.up_ops, self.decoders, self.pgfms_dec)):
+        decoder_features: List[torch.Tensor] = []
+        for j, (up, decoder, pgfm) in enumerate(zip(self.up_ops, self.decoders, self.decoder_pgfms)):
             z = up(z)
             skip = skips[-2 - j]
             if z.shape[2:] != skip.shape[2:]:
                 z = F.interpolate(z, size=skip.shape[2:], mode="trilinear", align_corners=False)
-            z = dec(torch.cat([z, skip], dim=1))
-            z = pgfm(z, priors)
-            decoder_feats.append(z)
+            z = pgfm(decoder(torch.cat([z, skip], dim=1)), priors)
+            decoder_features.append(z)
 
-        full = self.final_conv(z)
-        if not self.deep_supervision or self.ds_convs is None:
-            return full
+        full_resolution_logits = self.final_conv(z)
+        if not self.deep_supervision:
+            return full_resolution_logits
 
-        outputs = [full]
-        # decoder_feats are deepest-to-shallowest. Generate auxiliary outputs from the
-        # first (coarser) decoder stages. Dynamic loss resizes targets to each output.
-        for feat, head in zip(decoder_feats, self.ds_convs):
-            outputs.append(head(feat))
-        return outputs
+        coarse_logits = [
+            head(feature)
+            for head, feature in zip(self.deep_supervision_heads, decoder_features[:-1])
+        ]
+        return [full_resolution_logits] + list(reversed(coarse_logits))
 
-if __name__ == "__main__":
-    # Lightweight architectural smoke test independent of nnU-Net.
-    torch.manual_seed(0)
-    net = BoneAttentionUNetForNNUNet(
-        in_channels=1,
-        num_classes=2,
-        feature_map_sizes=(32, 64, 128, 256, 320, 320),
-        strides=((1, 1, 1), (2, 2, 2), (2, 2, 2), (2, 2, 2), (2, 2, 2), (2, 2, 2)),
-        deep_supervision=True,
-        ct_mean=300.0,
-        ct_std=500.0,
-    )
-    # 32^3 is sufficient for code-path testing while keeping memory modest.
-    x = torch.randn(1, 1, 32, 32, 32)
-    with torch.no_grad():
-        y = net(x)
-    print([tuple(t.shape) for t in y] if isinstance(y, list) else tuple(y.shape))
+
+PGMNet = BoneAttentionUNetForNNUNet
