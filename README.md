@@ -82,7 +82,7 @@ If the repository uses Git LFS for `.pth` files, install LFS and pull weights:
 
 ```bash
 git lfs install
-git clone https://github.com/jiejiecc/PGMNet.git
+git clone https://github.com/a03801/PGMNet.git
 cd PGMNet
 git lfs pull
 ```
